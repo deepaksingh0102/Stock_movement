@@ -1,263 +1,211 @@
 import datetime as dt
-from zoneinfo import ZoneInfo
-
+import io
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
+import requests
+from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, log_loss, brier_score_loss
 
-st.set_page_config(page_title="QQQ Intraday Replay", layout="wide")
-ET = ZoneInfo("America/New_York")
+st.set_page_config(page_title='QQQ Intraday Predictor', layout='wide')
 HORIZONS = [5, 15, 30, 60]
-# Move thresholds in basis points. These are hypotheses, NOT optimized/calibrated probabilities.
-MOVE_BPS = {5: 10, 15: 15, 30: 20, 60: 30}
+TZ = 'America/New_York'
+FEATURES = ['ret1','ret5','ret15','ema_spread','ema50_gap','vwap_gap','rsi','macd_hist','adx','atr_pct','rvol','range_pct','body_pct','wick_up','wick_down','break20','sin_time','cos_time']
 
-
-def secret(name):
-    try:
-        return st.secrets.get(name, "")
-    except Exception:
-        return ""
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_bars(start_iso, end_iso, feed, key, secret_key):
-    url = "https://data.alpaca.markets/v2/stocks/QQQ/bars"
-    params = {"start": start_iso, "end": end_iso, "timeframe": "1Min", "feed": feed,
-              "adjustment": "raw", "limit": 10000, "sort": "asc"}
-    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret_key}
-    records = []
-    token = None
-    with requests.Session() as session:
-        for _ in range(100):
-            p = dict(params)
-            if token:
-                p["page_token"] = token
-            try:
-                resp = session.get(url, params=p, headers=headers, timeout=35)
-                resp.raise_for_status()
-                payload = resp.json()
-            except requests.RequestException as exc:
-                detail = resp.text[:500] if "resp" in locals() else str(exc)
-                raise RuntimeError(f"Alpaca request failed: {detail}") from exc
-            records.extend(payload.get("bars") or [])
-            next_token = payload.get("next_page_token")
-            if not next_token:
-                break
-            if next_token == token:
-                raise RuntimeError("Alpaca pagination returned a repeated token.")
-            token = next_token
-        else:
-            raise RuntimeError("Exceeded pagination safety limit.")
-    if not records:
-        raise RuntimeError("No bars returned. Check API entitlement, date, and feed.")
-    df = pd.DataFrame(records).rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(ET)
-    df = df.set_index("timestamp").sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df[["open", "high", "low", "close", "volume"]].astype(float)
-
-
-def rma(s, period):
-    return s.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-
-
-def indicators(df):
-    # Features are computed on regular-session minutes only; no forward-looking operations.
-    x = df.copy()
-    c, h, l = x.close, x.high, x.low
-    x["ema9"] = c.ewm(span=9, adjust=False, min_periods=9).mean()
-    x["ema20"] = c.ewm(span=20, adjust=False, min_periods=20).mean()
-    x["ema50"] = c.ewm(span=50, adjust=False, min_periods=50).mean()
-    ema12 = c.ewm(span=12, adjust=False, min_periods=12).mean()
-    ema26 = c.ewm(span=26, adjust=False, min_periods=26).mean()
-    x["macd"] = ema12 - ema26
-    x["macd_signal"] = x.macd.ewm(span=9, adjust=False, min_periods=9).mean()
-    delta = c.diff()
-    up = rma(delta.clip(lower=0), 14)
-    down = rma((-delta).clip(lower=0), 14)
-    rs = up / down.replace(0, np.nan)
-    x["rsi"] = 100 - 100 / (1 + rs)
-    x.loc[(down == 0) & (up > 0), "rsi"] = 100
-    x.loc[(down == 0) & (up == 0), "rsi"] = 50
-    prev_c = c.shift(1)
-    tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-    x["atr"] = rma(tr, 14)
-    plus_move = h.diff()
-    minus_move = -l.diff()
-    plus_dm = plus_move.where((plus_move > minus_move) & (plus_move > 0), 0.0)
-    minus_dm = minus_move.where((minus_move > plus_move) & (minus_move > 0), 0.0)
-    atr_safe = x.atr.replace(0, np.nan)
-    x["plus_di"] = 100 * rma(plus_dm, 14) / atr_safe
-    x["minus_di"] = 100 * rma(minus_dm, 14) / atr_safe
-    dx = 100 * (x.plus_di - x.minus_di).abs() / (x.plus_di + x.minus_di).replace(0, np.nan)
-    x["adx"] = rma(dx, 14)
-    session = pd.Series(x.index.date, index=x.index)
-    typical = (h + l + c) / 3
-    cum_pv = (typical * x.volume).groupby(session).cumsum()
-    cum_vol = x.volume.groupby(session).cumsum().replace(0, np.nan)
-    x["vwap"] = cum_pv / cum_vol
-    # Prior-session same minute-of-day volume baseline (up to 20 observations).
-    # Uses only completed prior sessions; no future-volume leakage.
-    minute = x.index.hour * 60 + x.index.minute
-    volume_matrix = x.assign(day=x.index.date, minute=minute).pivot(index="day", columns="minute", values="volume")
-    baseline = volume_matrix.shift(1).rolling(20, min_periods=3).mean()
-    x["volume_baseline"] = [baseline.loc[d, m] for d, m in zip(x.index.date, minute)]
-    x["rvol"] = x.volume / x.volume_baseline.replace(0, np.nan)
-    body = (x.close - x.open).abs()
-    lower_wick = np.minimum(x.open, x.close) - x.low
-    upper_wick = x.high - np.maximum(x.open, x.close)
-    x["bull_engulf"] = (x.close > x.open) & (x.close.shift(1) < x.open.shift(1)) & (x.open <= x.close.shift(1)) & (x.close >= x.open.shift(1))
-    x["bear_engulf"] = (x.close < x.open) & (x.close.shift(1) > x.open.shift(1)) & (x.open >= x.close.shift(1)) & (x.close <= x.open.shift(1))
-    x["hammer"] = (lower_wick >= 2 * body) & (upper_wick <= body) & (body > 0)
-    x["shooting_star"] = (upper_wick >= 2 * body) & (lower_wick <= body) & (body > 0)
-    # Previous 20 bars, excluding current candle.
-    x["breakout"] = x.close > x.high.shift(1).rolling(20, min_periods=20).max()
-    x["breakdown"] = x.close < x.low.shift(1).rolling(20, min_periods=20).min()
+def clean(raw):
+    x = raw.copy()
+    if 'timestamp' in x.columns:
+        x['timestamp'] = pd.to_datetime(x['timestamp'], utc=True)
+        x = x.set_index('timestamp')
+    if x.index.tz is None:
+        x.index = x.index.tz_localize('UTC')
+    x.index = x.index.tz_convert(TZ)
+    x.columns = [str(c).lower() for c in x.columns]
+    x = x[['open','high','low','close','volume']].apply(pd.to_numeric, errors='coerce').dropna()
+    x = x[~x.index.duplicated(keep='last')].sort_index()
+    x = x.between_time('09:30','15:59')
+    x = x[x.index.dayofweek < 5]
     return x
 
+@st.cache_data(ttl=900)
+def alpaca(start, end, feed, key, secret):
+    headers = {'APCA-API-KEY-ID':key, 'APCA-API-SECRET-KEY':secret}
+    params = {'start':f'{start}T00:00:00Z','end':f'{end}T00:00:00Z', 'timeframe':'1Min','feed':feed,'limit':10000,'adjustment':'split','sort':'asc'}
+    rows=[]
+    with requests.Session() as s:
+        for _ in range(200):
+            r=s.get('https://data.alpaca.markets/v2/stocks/QQQ/bars',params=params,headers=headers,timeout=45)
+            r.raise_for_status()
+            payload=r.json()
+            rows.extend(payload.get('bars',[]))
+            token=payload.get('next_page_token')
+            if not token: break
+            params['page_token']=token
+        else: raise RuntimeError('Too many pages')
+    if not rows: raise ValueError('Alpaca returned no data')
+    return clean(pd.DataFrame(rows).rename(columns={'t':'timestamp','o':'open','h':'high','l':'low','c':'close','v':'volume'}))
 
-def signal(x):
-    needed = ["ema9", "ema20", "macd", "macd_signal", "rsi", "adx", "vwap", "rvol"]
-    valid = x[needed].notna().all(axis=1)
-    bull = (20 * (x.close > x.vwap).astype(int)
-            + 15 * (x.ema9 > x.ema20).astype(int)
-            + 15 * (x.macd > x.macd_signal).astype(int)
-            + 10 * x.rsi.between(50, 70).astype(int)
-            + 10 * (x.adx > 20).astype(int)
-            + 15 * (x.rvol >= 1.5).astype(int)
-            + 15 * (x.bull_engulf | x.hammer | x.breakout).astype(int))
-    bear = (20 * (x.close < x.vwap).astype(int)
-            + 15 * (x.ema9 < x.ema20).astype(int)
-            + 15 * (x.macd < x.macd_signal).astype(int)
-            + 10 * x.rsi.between(30, 50).astype(int)
-            + 10 * (x.adx > 20).astype(int)
-            + 15 * (x.rvol >= 1.5).astype(int)
-            + 15 * (x.bear_engulf | x.shooting_star | x.breakdown).astype(int))
-    x = x.copy()
-    x["bull_score"] = bull.where(valid)
-    x["bear_score"] = bear.where(valid)
-    # Only score >= 65 and strictly greater than opposing score triggers a signal.
-    x["signal"] = np.select([valid & (bull >= 65) & (bull > bear),
-                              valid & (bear >= 65) & (bear > bull)], ["BULLISH", "BEARISH"], default="WAIT")
-    x.loc[~valid, "signal"] = "INSUFFICIENT DATA"
+def rma(s,n):
+    return s.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+
+def make_features(df):
+    x=df.copy()
+    c,h,l,o,v=x.close,x.high,x.low,x.open,x.volume
+    # Do not carry daily returns across sessions.
+    day=pd.Series(x.index.date,index=x.index)
+    def day_shift(series,n): return series.groupby(day).shift(n)
+    x['ret1']=(c/day_shift(c,1)-1)*10000
+    x['ret5']=(c/day_shift(c,5)-1)*10000
+    x['ret15']=(c/day_shift(c,15)-1)*10000
+    e9=c.ewm(span=9,adjust=False).mean(); e20=c.ewm(span=20,adjust=False).mean(); e50=c.ewm(span=50,adjust=False).mean()
+    x['ema_spread']=(e9/e20-1)*10000
+    x['ema50_gap']=(c/e50-1)*10000
+    tp=(h+l+c)/3
+    x['vwap_gap']=(c/((tp*v).groupby(day).cumsum()/v.groupby(day).cumsum().replace(0,np.nan))-1)*10000
+    delta=c.diff(); gain=rma(delta.clip(lower=0),14); loss=rma((-delta).clip(lower=0),14)
+    x['rsi']=100-100/(1+gain/loss.replace(0,np.nan))
+    x.loc[(loss==0)&(gain>0),'rsi']=100
+    x.loc[(loss==0)&(gain==0),'rsi']=50
+    m=c.ewm(span=12,adjust=False).mean()-c.ewm(span=26,adjust=False).mean()
+    x['macd_hist']=(m-m.ewm(span=9,adjust=False).mean())/c*10000
+    prev=c.shift(); tr=pd.concat([h-l,(h-prev).abs(),(l-prev).abs()],axis=1).max(axis=1)
+    atr=rma(tr,14); x['atr_pct']=atr/c*10000
+    up=h.diff(); down=-l.diff(); pdm=up.where((up>down)&(up>0),0); mdm=down.where((down>up)&(down>0),0)
+    pdi=100*rma(pdm,14)/atr.replace(0,np.nan); mdi=100*rma(mdm,14)/atr.replace(0,np.nan)
+    x['adx']=rma(100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan),14)
+    # Same-minute prior-day volume baseline, with no current/future day volume.
+    minute=x.index.hour*60+x.index.minute
+    vol=x.assign(day=x.index.date,minute=minute).pivot(index='day',columns='minute',values='volume')
+    base=vol.shift(1).rolling(10,min_periods=3).mean()
+    x['rvol']=[v/base.loc[d,m] if pd.notna(base.loc[d,m]) and base.loc[d,m]>0 else np.nan for d,m,v in zip(x.index.date,minute,x.volume)]
+    x['rvol']=x.rvol.clip(0,20)
+    x['range_pct']=(h-l)/c*10000; x['body_pct']=(c-o)/c*10000
+    x['wick_up']=(h-np.maximum(c,o))/c*10000; x['wick_down']=(np.minimum(c,o)-l)/c*10000
+    high20=day_shift(h.groupby(day).rolling(20,min_periods=20).max().droplevel(0),1)
+    low20=day_shift(l.groupby(day).rolling(20,min_periods=20).min().droplevel(0),1)
+    x['break20']=np.where(c>high20,1,np.where(c<low20,-1,0))
+    minute_in_day=minute-(9*60+30)
+    x['sin_time']=np.sin(2*np.pi*minute_in_day/390)
+    x['cos_time']=np.cos(2*np.pi*minute_in_day/390)
+    x['session']=x.index.date
+    # Session-close outcomes, NEVER shift across days.
+    for horizon in HORIZONS:
+        future=c.groupby(day).shift(-horizon)
+        x[f'future_{horizon}']=(future/c-1)*10000
     return x
 
+def fit_predict(x,horizon,min_train_days=15,refit_every=5):
+    target=f'future_{horizon}'
+    days=np.array(sorted(x.session.unique()))
+    if len(days)<min_train_days+2:
+        raise ValueError(f'Need at least {min_train_days+2} sessions; found {len(days)}')
+    output=[]
+    model=None
+    for i in range(min_train_days,len(days)):
+        # Model for day i trained on prior days only. Exclude last h bars of prior day automatically via NaN labels.
+        if model is None or (i-min_train_days)%refit_every==0:
+            train=x[x.session.isin(days[:i])].dropna(subset=[target]).copy()
+            train=train[train[FEATURES].notna().sum(axis=1)>=12]
+            # 3 classes: down (< -threshold), sideways, up (> threshold).
+            # Threshold is predeclared, not tuned on the test set.
+            threshold={5:5,15:8,30:12,60:18}[horizon]
+            y=np.where(train[target]>threshold,2,np.where(train[target]<-threshold,0,1))
+            if len(np.unique(y))<3: continue
+            model=make_pipeline(SimpleImputer(strategy='median',add_indicator=False),StandardScaler(),LogisticRegression(max_iter=350,class_weight=None))
+            model.fit(train[FEATURES],y)
+        test=x[x.session==days[i]].copy()
+        test=test[test[FEATURES].notna().sum(axis=1)>=12]
+        if test.empty or model is None: continue
+        p=model.predict_proba(test[FEATURES]); prob=np.zeros((len(test),3))
+        for j,cl in enumerate(model.classes_): prob[:,int(cl)]=p[:,j]
+        test['p_down'],test['p_sideways'],test['p_up']=prob.T
+        test['prediction']=np.array(['DOWN','SIDEWAYS','UP'])[np.argmax(prob,axis=1)]
+        test['confidence']=prob.max(axis=1)
+        test['actual']=np.where(test[target]>threshold,'UP',np.where(test[target]<-threshold,'DOWN','SIDEWAYS'))
+        test.loc[test[target].isna(),'actual']=None
+        test['horizon']=horizon
+        output.append(test[['close','session','horizon','prediction','confidence','p_down','p_sideways','p_up','actual',target]])
+    if not output: raise ValueError('Insufficient training examples')
+    return pd.concat(output)
 
-def evaluate(day_df, horizon):
-    y = day_df.copy()
-    # Exact timestamp matching: missing bars cannot silently shorten the horizon.
-    future_index = y.index + pd.Timedelta(minutes=horizon)
-    future_close = y.close.reindex(future_index).to_numpy()
-    y["future_close"] = future_close
-    y["return_bps"] = (y.future_close / y.close - 1) * 10000
-    threshold = MOVE_BPS[horizon]
-    y["actual"] = np.select([y.return_bps > threshold, y.return_bps < -threshold], ["UP", "DOWN"], default="SIDEWAYS")
-    y.loc[y.future_close.isna(), "actual"] = "NOT AVAILABLE"
-    y["correct"] = ((y.signal.eq("BULLISH") & y.actual.eq("UP")) |
-                    (y.signal.eq("BEARISH") & y.actual.eq("DOWN")))
-    return y
+def metrics(pred):
+    z=pred.dropna(subset=['actual']).copy()
+    if z.empty: return None
+    classes=['DOWN','SIDEWAYS','UP']
+    probs=z[['p_down','p_sideways','p_up']].to_numpy()
+    yi=z.actual.map({k:i for i,k in enumerate(classes)}).to_numpy()
+    base=max(z.actual.value_counts(normalize=True))
+    return {'Evaluated':len(z),'Accuracy':accuracy_score(z.actual,z.prediction),'Majority baseline':base,
+            'Log loss':log_loss(yi,probs,labels=[0,1,2]),'Multiclass Brier':np.mean(np.sum((probs-np.eye(3)[yi])**2,axis=1)),
+            'Actionable %':(z.prediction!='SIDEWAYS').mean()}
 
-
-st.title("QQQ | Intraday Prediction Replay")
-st.caption("Historical QQQ only · 1-minute candles · 5/15/30/60-minute outcomes · No live trading")
+st.title('QQQ | Intraday Prediction & Walk-forward Validation')
+st.caption('Research tool only. Predictions are statistical estimates, not guarantees. No order execution.')
 with st.sidebar:
-    st.header("Settings")
-    selected_date = st.date_input("Replay date", value=dt.date(2026, 10, 23), max_value=dt.date.today())
-    feed = st.selectbox("Alpaca feed", ["iex", "sip"], help="SIP needs appropriate Alpaca market-data entitlement.")
-    horizon = st.selectbox("Prediction horizon (minutes)", HORIZONS, index=1)
-    api_key = st.text_input("Alpaca API key", value=secret("ALPACA_API_KEY"), type="password")
-    api_secret = st.text_input("Alpaca secret key", value=secret("ALPACA_SECRET_KEY"), type="password")
-    load = st.button("Fetch QQQ", type="primary", use_container_width=True)
+    st.header('Data')
+    source=st.radio('Source',['Upload CSV','Alpaca API'],index=0)
+    if source=='Upload CSV':
+        uploaded=st.file_uploader('QQQ 1-minute CSV',type=['csv'])
+    else:
+        start=st.date_input('Start',dt.date.today()-dt.timedelta(days=75))
+        end=st.date_input('End (exclusive)',dt.date.today()+dt.timedelta(days=1))
+        feed=st.selectbox('Feed',['iex','sip'])
+        key=st.text_input('Alpaca key',value=st.secrets.get('ALPACA_API_KEY',''),type='password')
+        secret=st.text_input('Alpaca secret',value=st.secrets.get('ALPACA_SECRET_KEY',''),type='password')
+    min_train=st.slider('Initial training sessions',10,35,15)
+    refit=st.slider('Refit every N sessions',1,10,5)
+    run=st.button('Run walk-forward test',type='primary')
 
-if not load:
-    st.info("Set Alpaca credentials, select a feed, and click **Fetch QQQ**. The default test date is October 23, 2026.")
-    st.stop()
-if not api_key or not api_secret:
-    st.error("Add Alpaca credentials in Streamlit Secrets or enter them in the sidebar.")
-    st.stop()
-if selected_date.weekday() >= 5:
-    st.warning("The selected date is a weekend; US equities do not have a regular trading session.")
-    st.stop()
+if run:
+    try:
+        if source=='Upload CSV':
+            if uploaded is None: st.error('Upload a CSV first.'); st.stop()
+            raw=clean(pd.read_csv(uploaded))
+        else:
+            if not key or not secret: st.error('Provide Alpaca credentials.'); st.stop()
+            raw=alpaca(str(start),str(end),feed,key,secret)
+        st.session_state['raw']=raw
+        with st.spinner('Computing features and walk-forward forecasts...'):
+            feat=make_features(raw)
+            results={h:fit_predict(feat,h,min_train,refit) for h in HORIZONS}
+        st.session_state['results']=results
+    except Exception as e:
+        st.error(f'Unable to complete test: {e}')
 
-# Fetch previous sessions for indicator warmup and same-minute prior-session RVOL.
-start = dt.datetime.combine(selected_date - dt.timedelta(days=45), dt.time(0), tzinfo=ET).isoformat()
-end = dt.datetime.combine(selected_date + dt.timedelta(days=1), dt.time(0), tzinfo=ET).isoformat()
-try:
-    with st.spinner("Fetching historical QQQ bars from Alpaca..."):
-        raw = fetch_bars(start, end, feed, api_key, api_secret)
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
-
-regular = raw.between_time("09:30", "15:59")
-regular = regular[regular.index.weekday < 5]
-if regular.empty:
-    st.error("No regular-session bars found.")
-    st.stop()
-all_data = signal(indicators(regular))
-day = all_data[all_data.index.date == selected_date].copy()
-if day.empty:
-    st.error("No QQQ regular-session data found for this date. Check your feed, permissions, or date.")
-    st.stop()
-if len(day) < 300:
-    st.warning(f"Only {len(day)} one-minute bars returned (typical full session ~390). IEX or missing data may affect results.")
-
-st.caption(f"Feed: {feed.upper()} | Date: {selected_date.isoformat()} | Bars: {len(day)} | Times: US Eastern")
-selected_time = st.select_slider("Replay timestamp (prediction after candle close)", options=list(day.index),
-                                  value=day.index[min(60, len(day)-1)],
-                                  format_func=lambda x: x.strftime("%I:%M %p ET"))
-row = day.loc[selected_time]
-assessed = evaluate(day, horizon)
-result = assessed.loc[selected_time]
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("QQQ close", f"${row.close:,.2f}")
-c2.metric("Signal", str(row.signal))
-c3.metric("Bullish score", "N/A" if pd.isna(row.bull_score) else f"{row.bull_score:.0f}/100")
-c4.metric("Bearish score", "N/A" if pd.isna(row.bear_score) else f"{row.bear_score:.0f}/100")
-st.info("Scores are rule-based signal alignment, **not probabilities**. Outcomes are revealed only for evaluation after the selected timestamp.")
-
-chart_data = day.loc[:selected_time].tail(130)
-fig = go.Figure()
-fig.add_trace(go.Candlestick(x=chart_data.index, open=chart_data.open, high=chart_data.high,
-                             low=chart_data.low, close=chart_data.close, name="QQQ"))
-for col, color in [("vwap", "#a855f7"), ("ema9", "#0ea5e9"), ("ema20", "#f59e0b")]:
-    fig.add_trace(go.Scatter(x=chart_data.index, y=chart_data[col], name=col.upper(), line=dict(color=color, width=1.5)))
-fig.update_layout(height=520, xaxis_rangeslider_visible=False, title="QQQ candles up to selected replay timestamp",
-                  xaxis_title="US Eastern", yaxis_title="Price ($)")
-st.plotly_chart(fig, use_container_width=True)
-
-st.subheader(f"Actual next {horizon}-minute outcome (revealed after prediction)")
-a, b, c = st.columns(3)
-a.metric("Actual outcome", str(result.actual))
-b.metric("Actual return", "Unavailable" if pd.isna(result.return_bps) else f"{result.return_bps:+.1f} bps")
-c.metric("Signal matched direction", "N/A" if result.actual == "NOT AVAILABLE" or result.signal not in ["BULLISH", "BEARISH"] else ("Yes" if result.correct else "No"))
-
-st.subheader("All horizons at selected timestamp")
-rows = []
-for h in HORIZONS:
-    z = evaluate(day, h).loc[selected_time]
-    rows.append({"Horizon": f"{h} min", "Signal": z.signal, "Bull score": z.bull_score,
-                 "Bear score": z.bear_score, "Actual": z.actual,
-                 "Return (bps)": round(z.return_bps, 2) if pd.notna(z.return_bps) else np.nan})
-st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-st.subheader("October 23 signal evaluation")
-summary = []
-for h in HORIZONS:
-    z = evaluate(day, h)
-    trades = z[z.signal.isin(["BULLISH", "BEARISH"]) & z.future_close.notna()]
-    summary.append({"Horizon": f"{h} min", "Evaluable signals": len(trades),
-                    "Directional hit rate": f"{100 * trades.correct.mean():.1f}%" if len(trades) else "N/A",
-                    "Average signed return (bps)": round(np.where(trades.signal.eq("BULLISH"), trades.return_bps, -trades.return_bps).mean(), 2) if len(trades) else np.nan})
-st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
-st.caption("Hit rate = signal direction matched an outcome beyond the horizon's sideways threshold. Signals overlap and are not independent trades. No trading costs, slippage, or stops are included.")
-
-with st.expander("View indicator readings at replay timestamp"):
-    cols = ["open", "high", "low", "close", "volume", "vwap", "ema9", "ema20", "ema50", "macd", "macd_signal", "rsi", "adx", "atr", "rvol", "bull_engulf", "bear_engulf", "hammer", "shooting_star", "breakout", "breakdown"]
-    st.dataframe(pd.DataFrame({"Indicator": cols, "Value": [row[k] for k in cols]}), hide_index=True)
-
-csv = evaluate(day, horizon).reset_index().to_csv(index=False).encode("utf-8")
-st.download_button("Download replay results CSV", csv, file_name=f"QQQ_{selected_date}_{horizon}min.csv", mime="text/csv")
+if 'results' in st.session_state:
+    results=st.session_state['results']; raw=st.session_state['raw']
+    st.write(f'**QQQ data:** {raw.index.min()} through {raw.index.max()} | {len(raw):,} minute bars | {len(set(raw.index.date))} sessions')
+    records=[]
+    for h,z in results.items():
+        m=metrics(z)
+        if m: records.append({'Horizon':f'{h} min',**m})
+    summary=pd.DataFrame(records)
+    st.subheader('Out-of-sample performance (chronological walk-forward)')
+    st.dataframe(summary.style.format({'Accuracy':'{:.1%}','Majority baseline':'{:.1%}','Log loss':'{:.3f}','Multiclass Brier':'{:.3f}','Actionable %':'{:.1%}'}),hide_index=True,use_container_width=True)
+    st.caption('Majority baseline is the most common realized class over the test period; it is a descriptive reference, not a tradable strategy. Results are correlated because forecasts overlap. No spread, slippage or fill simulation is included.')
+    h=st.selectbox('Prediction horizon (minutes)',HORIZONS,index=1)
+    z=results[h]
+    days=sorted(z.session.unique())
+    chosen=st.selectbox('Historical replay day',days,index=len(days)-1)
+    day=z[z.session==chosen]
+    valid=day.dropna(subset=['actual'])
+    if len(valid):
+        cm=pd.crosstab(valid.actual,valid.prediction,dropna=False)
+        st.write('**Confusion matrix** (actual rows, predicted columns)')
+        st.dataframe(cm)
+    view=day.copy()
+    view['timestamp']=view.index
+    st.dataframe(view[['timestamp','close','prediction','confidence','p_up','p_down','p_sideways','actual']].tail(60),hide_index=True,use_container_width=True)
+    chart=raw[raw.index.date==chosen]
+    fig=go.Figure(go.Candlestick(x=chart.index,open=chart.open,high=chart.high,low=chart.low,close=chart.close,name='QQQ'))
+    fig.update_layout(height=480,xaxis_rangeslider_visible=False,title=f'QQQ {chosen} (ET)')
+    st.plotly_chart(fig,use_container_width=True)
+    csv=pd.concat(results.values()).reset_index().rename(columns={'index':'timestamp'}).to_csv(index=False).encode()
+    st.download_button('Download all predictions CSV',csv,'QQQ_walkforward_predictions.csv','text/csv')
+    st.info('Latest test-day probabilities are historical replay estimates. To generate a live forecast, download the latest complete QQQ candles and rerun; this version deliberately does not extrapolate an unvalidated model into live trading.')
+else:
+    st.info('Upload the existing QQQ 1-minute CSV or connect Alpaca, then click Run walk-forward test. This upgrades your existing Streamlit app; no second app is needed.')
