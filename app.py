@@ -18,25 +18,61 @@ FEATURES = ['ret1','ret5','ret15','ema_spread','ema50_gap','vwap_gap','rsi','mac
 
 def clean(raw):
     x = raw.copy()
-    if 'timestamp' in x.columns:
-        parsed = pd.to_datetime(x["timestamp"], errors="coerce")
-if parsed.dt.tz is None:
-    x["timestamp"] = parsed.dt.tz_localize(
-        "America/New_York"
-    )
-else:
-    x["timestamp"] = parsed.dt.tz_convert(
-        "America/New_York"
-    )
-        x = x.set_index('timestamp')
-    if x.index.tz is None:
-        x.index = x.index.tz_localize('UTC')
-    x.index = x.index.tz_convert(TZ)
+
+    # Normalize column names
     x.columns = [str(c).lower() for c in x.columns]
-    x = x[['open','high','low','close','volume']].apply(pd.to_numeric, errors='coerce').dropna()
-    x = x[~x.index.duplicated(keep='last')].sort_index()
-    x = x.between_time('09:30','15:59')
+
+    # Convert timestamp to New York timezone
+    if "timestamp" in x.columns:
+        parsed = pd.to_datetime(
+            x["timestamp"],
+            errors="coerce"
+        )
+
+        if parsed.dt.tz is None:
+            # Assume timezone-naive CSV timestamps are Eastern
+            x["timestamp"] = parsed.dt.tz_localize(
+                "America/New_York",
+                ambiguous="NaT",
+                nonexistent="NaT"
+            )
+        else:
+            x["timestamp"] = parsed.dt.tz_convert(
+                "America/New_York"
+            )
+
+        x = x.set_index("timestamp")
+
+    # Handle existing datetime index
+    if not isinstance(x.index, pd.DatetimeIndex):
+        raise ValueError("Missing valid timestamp column")
+
+    if x.index.tz is None:
+        x.index = x.index.tz_localize(
+            "America/New_York",
+            ambiguous="NaT",
+            nonexistent="NaT"
+        )
+    else:
+        x.index = x.index.tz_convert(
+            "America/New_York"
+        )
+
+    # Keep required price and volume columns
+    required = ["open", "high", "low", "close", "volume"]
+
+    x = x[required].apply(
+        pd.to_numeric, errors="coerce"
+    ).dropna()
+
+    # Remove invalid and duplicate timestamps
+    x = x[~x.index.isna()]
+    x = x[~x.index.duplicated(keep="last")]
+    x = x.sort_index()
+        # Keep regular US trading hours
+    x = x.between_time("09:30", "15:59")
     x = x[x.index.dayofweek < 5]
+
     return x
 
 @st.cache_data(ttl=60, show_spinner=False)
