@@ -190,10 +190,42 @@ def metrics(pred):
 st.title('QQQ | Intraday Prediction & Walk-forward Validation')
 st.caption('Research tool only. Predictions are statistical estimates, not guarantees. No order execution.')
 # Read credentials automatically from Streamlit Secrets
-API_KEY = st.secrets.get("ALPACA_API_KEY", "")
-API_SECRET = st.secrets.get("ALPACA_SECRET_KEY", "")
-DEFAULT_FEED = st.secrets.get("ALPACA_FEED", "iex")
+def get_secret(*names):
+    for name in names:
+        value = st.secrets.get(name, "")
+        if value and str(value).strip():
+            return str(value).strip()
+    return ""
 
+API_KEY = get_secret(
+    "ALPACA_API_KEY",
+    "APCA_API_KEY_ID",
+    "ALPACA_KEY"
+)
+
+API_SECRET = get_secret(
+    "ALPACA_SECRET_KEY",
+    "APCA_API_SECRET_KEY",
+    "ALPACA_SECRET"
+)
+
+DEFAULT_FEED = get_secret("ALPACA_FEED") or "iex"
+with st.sidebar.expander("Alpaca Connection Status"):
+    st.write(
+        "API Key:",
+        "Configured" if API_KEY else "Missing"
+    )
+
+    st.write(
+        "Secret Key:",
+        "Configured" if API_SECRET else "Missing"
+    )
+
+    if API_KEY and API_SECRET:
+        st.success("Credentials loaded from Secrets")
+    else:
+        st.error("Credentials not found")
+        
 CHART_WINDOWS = {
     "5 minutes": 5,
     "15 minutes": 15,
