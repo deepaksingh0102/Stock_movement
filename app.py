@@ -1,210 +1,275 @@
 import datetime as dt
-import os
-import warnings
-
+import io
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import requests
+from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, log_loss, brier_score_loss
 
-import qqq_core as q
+st.set_page_config(page_title='QQQ Intraday Predictor', layout='wide')
+HORIZONS = [5, 15, 30, 60]
+TZ = 'America/New_York'
+FEATURES = ['ret1','ret5','ret15','ema_spread','ema50_gap','vwap_gap','rsi','macd_hist','adx','atr_pct','rvol','range_pct','body_pct','wick_up','wick_down','break20','sin_time','cos_time']
 
-warnings.filterwarnings("ignore")
-st.set_page_config(page_title="QQQ Intraday Walk-forward", layout="wide")
+def clean(raw):
+    x = raw.copy()
+    if 'timestamp' in x.columns:
+        x['timestamp'] = pd.to_datetime(x['timestamp'], utc=True)
+        x = x.set_index('timestamp')
+    if x.index.tz is None:
+        x.index = x.index.tz_localize('UTC')
+    x.index = x.index.tz_convert(TZ)
+    x.columns = [str(c).lower() for c in x.columns]
+    x = x[['open','high','low','close','volume']].apply(pd.to_numeric, errors='coerce').dropna()
+    x = x[~x.index.duplicated(keep='last')].sort_index()
+    x = x.between_time('09:30','15:59')
+    x = x[x.index.dayofweek < 5]
+    return x
 
-LOG_PATH = os.environ.get("QQQ_LOG_PATH", "live_predictions.csv")
-FMT_SUM = {c: "{:.4f}" for c in ["Mean", "CI low", "CI high"]} | {"Days > 0": "{:.0%}"}
+@st.cache_data(ttl=60, show_spinner=False)
+def alpaca(start, end, feed, key, secret):
+    headers = {'APCA-API-KEY-ID':key, 'APCA-API-SECRET-KEY':secret}
+    params = {'start':start,'end':end, 'timeframe':'1Min','feed':feed,'limit':10000,'adjustment':'split','sort':'asc'}
+    rows=[]
+    with requests.Session() as s:
+        for _ in range(200):
+            r=s.get('https://data.alpaca.markets/v2/stocks/QQQ/bars',params=params,headers=headers,timeout=45)
+            r.raise_for_status()
+            payload=r.json()
+            rows.extend(payload.get('bars',[]))
+            token=payload.get('next_page_token')
+            if not token: break
+            params['page_token']=token
+        else: raise RuntimeError('Too many pages')
+    if not rows: raise ValueError('Alpaca returned no data')
+    return clean(pd.DataFrame(rows).rename(columns={'t':'timestamp','o':'open','h':'high','l':'low','c':'close','v':'volume'}))
 
+def rma(s,n):
+    return s.ewm(alpha=1/n,adjust=False,min_periods=n).mean()
 
-def secret(name):
-    try:
-        return st.secrets.get(name, "")
-    except Exception:
-        return ""
+def make_features(df):
+    x=df.copy()
+    c,h,l,o,v=x.close,x.high,x.low,x.open,x.volume
+    # Do not carry daily returns across sessions.
+    day=pd.Series(x.index.date,index=x.index)
+    def day_shift(series,n): return series.groupby(day).shift(n)
+    x['ret1']=(c/day_shift(c,1)-1)*10000
+    x['ret5']=(c/day_shift(c,5)-1)*10000
+    x['ret15']=(c/day_shift(c,15)-1)*10000
+    e9=c.ewm(span=9,adjust=False).mean(); e20=c.ewm(span=20,adjust=False).mean(); e50=c.ewm(span=50,adjust=False).mean()
+    x['ema_spread']=(e9/e20-1)*10000
+    x['ema50_gap']=(c/e50-1)*10000
+    tp=(h+l+c)/3
+    x['vwap_gap']=(c/((tp*v).groupby(day).cumsum()/v.groupby(day).cumsum().replace(0,np.nan))-1)*10000
+    delta=c.diff(); gain=rma(delta.clip(lower=0),14); loss=rma((-delta).clip(lower=0),14)
+    x['rsi']=100-100/(1+gain/loss.replace(0,np.nan))
+    x.loc[(loss==0)&(gain>0),'rsi']=100
+    x.loc[(loss==0)&(gain==0),'rsi']=50
+    m=c.ewm(span=12,adjust=False).mean()-c.ewm(span=26,adjust=False).mean()
+    x['macd_hist']=(m-m.ewm(span=9,adjust=False).mean())/c*10000
+    prev=c.shift(); tr=pd.concat([h-l,(h-prev).abs(),(l-prev).abs()],axis=1).max(axis=1)
+    atr=rma(tr,14); x['atr_pct']=atr/c*10000
+    up=h.diff(); down=-l.diff(); pdm=up.where((up>down)&(up>0),0); mdm=down.where((down>up)&(down>0),0)
+    pdi=100*rma(pdm,14)/atr.replace(0,np.nan); mdi=100*rma(mdm,14)/atr.replace(0,np.nan)
+    x['adx']=rma(100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan),14)
+    # Same-minute prior-day volume baseline, with no current/future day volume.
+    minute=x.index.hour*60+x.index.minute
+    vol=x.assign(day=x.index.date,minute=minute).pivot(index='day',columns='minute',values='volume')
+    base=vol.shift(1).rolling(10,min_periods=3).mean()
+    x['rvol']=[v/base.loc[d,m] if pd.notna(base.loc[d,m]) and base.loc[d,m]>0 else np.nan for d,m,v in zip(x.index.date,minute,x.volume)]
+    x['rvol']=x.rvol.clip(0,20)
+    x['range_pct']=(h-l)/c*10000; x['body_pct']=(c-o)/c*10000
+    x['wick_up']=(h-np.maximum(c,o))/c*10000; x['wick_down']=(np.minimum(c,o)-l)/c*10000
+    high20=day_shift(h.groupby(day).rolling(20,min_periods=20).max().droplevel(0),1)
+    low20=day_shift(l.groupby(day).rolling(20,min_periods=20).min().droplevel(0),1)
+    x['break20']=np.where(c>high20,1,np.where(c<low20,-1,0))
+    minute_in_day=minute-(9*60+30)
+    x['sin_time']=np.sin(2*np.pi*minute_in_day/390)
+    x['cos_time']=np.cos(2*np.pi*minute_in_day/390)
+    x['session']=x.index.date
+    # Session-close outcomes, NEVER shift across days.
+    for horizon in HORIZONS:
+        future=c.groupby(day).shift(-horizon)
+        x[f'future_{horizon}']=(future/c-1)*10000
+    return x
 
+def fit_predict(x,horizon,min_train_days=15,refit_every=5):
+    target=f'future_{horizon}'
+    days=np.array(sorted(x.session.unique()))
+    if len(days)<min_train_days+2:
+        raise ValueError(f'Need at least {min_train_days+2} sessions; found {len(days)}')
+    output=[]
+    model=None
+    for i in range(min_train_days,len(days)):
+        # Model for day i trained on prior days only. Exclude last h bars of prior day automatically via NaN labels.
+        if model is None or (i-min_train_days)%refit_every==0:
+            train=x[x.session.isin(days[:i])].dropna(subset=[target]).copy()
+            train=train[train[FEATURES].notna().sum(axis=1)>=12]
+            # 3 classes: down (< -threshold), sideways, up (> threshold).
+            # Threshold is predeclared, not tuned on the test set.
+            threshold={5:5,15:8,30:12,60:18}[horizon]
+            y=np.where(train[target]>threshold,2,np.where(train[target]<-threshold,0,1))
+            if len(np.unique(y))<3: continue
+            model=make_pipeline(SimpleImputer(strategy='median',add_indicator=False),StandardScaler(),LogisticRegression(max_iter=350,class_weight=None))
+            model.fit(train[FEATURES],y)
+        test=x[x.session==days[i]].copy()
+        test=test[test[FEATURES].notna().sum(axis=1)>=12]
+        if test.empty or model is None: continue
+        p=model.predict_proba(test[FEATURES]); prob=np.zeros((len(test),3))
+        for j,cl in enumerate(model.classes_): prob[:,int(cl)]=p[:,j]
+        test['p_down'],test['p_sideways'],test['p_up']=prob.T
+        test['prediction']=np.array(['DOWN','SIDEWAYS','UP'])[np.argmax(prob,axis=1)]
+        test['confidence']=prob.max(axis=1)
+        test['actual']=np.where(test[target]>threshold,'UP',np.where(test[target]<-threshold,'DOWN','SIDEWAYS'))
+        test.loc[test[target].isna(),'actual']=None
+        test['horizon']=horizon
+        output.append(test[['close','session','horizon','prediction','confidence','p_down','p_sideways','p_up','actual',target]])
+    if not output: raise ValueError('Insufficient training examples')
+    return pd.concat(output)
 
-@st.cache_data(ttl=900, show_spinner=False)
-def cached_alpaca(start, end, feed, key, sec):
-    return q.fetch_alpaca(start, end, feed, key, sec)
+def metrics(pred):
+    z=pred.dropna(subset=['actual']).copy()
+    if z.empty: return None
+    classes=['DOWN','SIDEWAYS','UP']
+    probs=z[['p_down','p_sideways','p_up']].to_numpy()
+    yi=z.actual.map({k:i for i,k in enumerate(classes)}).to_numpy()
+    base=max(z.actual.value_counts(normalize=True))
+    return {'Evaluated':len(z),'Accuracy':accuracy_score(z.actual,z.prediction),'Majority baseline':base,
+            'Log loss':log_loss(yi,probs,labels=[0,1,2]),'Multiclass Brier':np.mean(np.sum((probs-np.eye(3)[yi])**2,axis=1)),
+            'Actionable %':(z.prediction!='SIDEWAYS').mean()}
 
-
-@st.cache_data(show_spinner=False)
-def cached_csv(buf):
-    import io
-    return q.load_csv(io.BytesIO(buf))
-
-
-st.title("QQQ | Intraday walk-forward validation")
-st.caption("Research tool. Not financial advice, and no orders are placed. The question this app answers is "
-           "whether the model beats a naive baseline out of sample, not what to trade.")
-
+st.title('QQQ | Intraday Prediction & Walk-forward Validation')
+st.caption('Research tool only. Predictions are statistical estimates, not guarantees. No order execution.')
 with st.sidebar:
-    st.header("Data")
-    source = st.radio("Source", ["Upload CSV", "Alpaca API"])
-    uploaded = key = sec = None
-    if source == "Upload CSV":
-        uploaded = st.file_uploader("QQQ 1-minute CSV (timestamp,open,high,low,close,volume)", type=["csv"])
+    st.header('Data')
+    source=st.radio('Source',['Upload CSV','Alpaca API'],index=1)
+    if source=='Upload CSV':
+        uploaded=st.file_uploader('QQQ 1-minute CSV',type=['csv'])
     else:
-        start = st.date_input("Start", dt.date.today() - dt.timedelta(days=120))
-        feed = st.selectbox("Feed", ["iex", "sip"])
-        key = st.text_input("Alpaca key", value=secret("ALPACA_API_KEY"), type="password")
-        sec = st.text_input("Alpaca secret", value=secret("ALPACA_SECRET_KEY"), type="password")
-    st.header("Model")
-    k = st.slider("Label threshold k (sigma units)", 0.1, 1.5, q.DEFAULT_K, 0.05,
-                  help="UP/DOWN = forward return beyond ±k·σ·√horizon, with σ a causal EWMA of 1-minute volatility.")
-    min_train = st.slider("Initial training sessions", 10, 35, 15)
-    refit = st.slider("Refit every N sessions", 1, 10, 5)
-    q.MODEL_C = st.select_slider("Regularization C (smaller = stronger)", [0.0005, 0.001, 0.01, 0.1, 1.0], 1.0)
-    cost = st.number_input("Assumed round-trip cost (bps)", 0.0, 10.0, 1.0, 0.1)
-    run = st.button("Run walk-forward test", type="primary")
-
-
-def load_raw():
-    if source == "Upload CSV":
-        if uploaded is None:
-            raise ValueError("Upload a CSV first.")
-        return cached_csv(uploaded.getvalue())
-    if not key or not sec:
-        raise ValueError("Provide Alpaca credentials.")
-    return cached_alpaca(str(start), None, feed, key, sec)
-
+        start=st.date_input('Start',dt.date.today()-dt.timedelta(days=75))
+        end=st.date_input('End (exclusive)',dt.date.today()+dt.timedelta(days=1))
+        feed=st.selectbox('Feed',['iex','sip'])
+        key=st.text_input('Alpaca key',value=st.secrets.get('ALPACA_API_KEY',''),type='password')
+        secret=st.text_input('Alpaca secret',value=st.secrets.get('ALPACA_SECRET_KEY',''),type='password')
+    min_train=st.slider('Initial training sessions',10,35,15)
+    refit=st.slider('Refit every N sessions',1,10,5)
+    run=st.button('Run walk-forward test',type='primary')
 
 if run:
     try:
-        raw = load_raw()
-        with st.spinner("Building grid, features and walk-forward forecasts..."):
-            grid, info = q.prepare(raw.reset_index())
-            x = q.make_features(grid, k=k)
-            st.session_state.update(grid=grid, info=info, x=x, cost=cost,
-                                    results=q.run_walk_forward(x, min_train_days=min_train, refit_every=refit))
+        if source=='Upload CSV':
+            if uploaded is None: st.error('Upload a CSV first.'); st.stop()
+            raw=clean(pd.read_csv(uploaded))
+        else:
+            if not key or not secret: st.error('Provide Alpaca credentials.'); st.stop()
+            raw=alpaca(dt.datetime.combine(start,dt.time.min,dt.timezone.utc).isoformat(),dt.datetime.combine(end,dt.time.min,dt.timezone.utc).isoformat(),feed,key,secret)
+        st.session_state['raw']=raw
+        with st.spinner('Computing features and walk-forward forecasts...'):
+            feat=make_features(raw)
+            results={h:fit_predict(feat,h,min_train,refit) for h in HORIZONS}
+        st.session_state['results']=results
     except Exception as e:
-        st.error(f"Unable to complete test: {e}")
+        st.error(f'Unable to complete test: {e}')
 
-tab_val, tab_live = st.tabs(["Walk-forward validation", "Live forecast & log"])
+if 'results' in st.session_state:
+    results=st.session_state['results']; raw=st.session_state['raw']
+    st.write(f'**QQQ data:** {raw.index.min()} through {raw.index.max()} | {len(raw):,} minute bars | {len(set(raw.index.date))} sessions')
+    records=[]
+    for h,z in results.items():
+        m=metrics(z)
+        if m: records.append({'Horizon':f'{h} min',**m})
+    summary=pd.DataFrame(records)
+    st.subheader('Out-of-sample performance (chronological walk-forward)')
+    st.dataframe(summary.style.format({'Accuracy':'{:.1%}','Majority baseline':'{:.1%}','Log loss':'{:.3f}','Multiclass Brier':'{:.3f}','Actionable %':'{:.1%}'}),hide_index=True,use_container_width=True)
+    st.caption('Majority baseline is the most common realized class over the test period; it is a descriptive reference, not a tradable strategy. Results are correlated because forecasts overlap. No spread, slippage or fill simulation is included.')
+    h=st.selectbox('Prediction horizon (minutes)',HORIZONS,index=1)
+    z=results[h]
+    days=sorted(z.session.unique())
+    chosen=st.selectbox('Historical replay day',days,index=len(days)-1)
+    day=z[z.session==chosen]
+    valid=day.dropna(subset=['actual'])
+    if len(valid):
+        cm=pd.crosstab(valid.actual,valid.prediction,dropna=False)
+        st.write('**Confusion matrix** (actual rows, predicted columns)')
+        st.dataframe(cm)
+    view=day.copy()
+    view['timestamp']=view.index
+    st.dataframe(view[['timestamp','close','prediction','confidence','p_up','p_down','p_sideways','actual']].tail(60),hide_index=True,use_container_width=True)
+    chart=raw[raw.index.date==chosen]
+    fig=go.Figure(go.Candlestick(x=chart.index,open=chart.open,high=chart.high,low=chart.low,close=chart.close,name='QQQ'))
+    fig.update_layout(height=480,xaxis_rangeslider_visible=False,title=f'QQQ {chosen} (ET)')
+    st.plotly_chart(fig,use_container_width=True)
+    csv=pd.concat(results.values()).reset_index().rename(columns={'index':'timestamp'}).to_csv(index=False).encode()
+    st.download_button('Download all predictions CSV',csv,'QQQ_walkforward_predictions.csv','text/csv')
+    st.info('Latest test-day probabilities are historical replay estimates. To generate a live forecast, download the latest complete QQQ candles and rerun; this version deliberately does not extrapolate an unvalidated model into live trading.')
+else:
+    st.info('Upload the existing QQQ 1-minute CSV or connect Alpaca, then click Run walk-forward test. This upgrades your existing Streamlit app; no second app is needed.')
 
-with tab_val:
-    if "results" not in st.session_state:
-        st.info("Load data and click **Run walk-forward test**.")
-    else:
-        res, info, grid, cost_bps = (st.session_state[n] for n in ("results", "info", "grid", "cost"))
-        st.write(f"**Data:** {grid.index.min():%Y-%m-%d} to {grid.index.max():%Y-%m-%d} · "
-                 f"{info['sessions']} sessions · {info['bars']:,} bars · "
-                 f"{info['missing_bars']:,} missing minutes (never filled with invented prices)")
-        if info["dropped_sessions"]:
-            st.warning("Dropped sessions with too few bars (half days or partial downloads): " +
-                       ", ".join(f"{d} ({n} bars)" for d, n in info["dropped_sessions"]))
 
-        st.subheader("Verdict by horizon: does the model beat the baseline?")
-        st.caption("Baseline = class frequencies of the training set the model was fit on. "
-                   "Per-day numbers are means across test sessions with a bootstrap-over-days 95% interval; "
-                   "an interval that excludes zero is the minimum bar for claiming skill.")
-        verdict = []
-        for h, z in res.items():
-            s = q.summarize_days(q.daily_metrics(z, cost_bps)).set_index("Metric")
-            ll = s.loc["Log-loss gain vs prior"]
-            status = ("Beats baseline" if ll["CI low"] > 0 else
-                      "Worse than baseline" if ll["CI high"] < 0 else "Indistinguishable from baseline")
-            verdict.append({"Horizon": f"{h} min", "Test days": int(ll["Days"]), "Log-loss gain": ll["Mean"],
-                            "95% CI low": ll["CI low"], "95% CI high": ll["CI high"],
-                            "Days beating baseline": ll["Days > 0"], "Verdict": status})
-        st.dataframe(pd.DataFrame(verdict).style.format(
-            {"Log-loss gain": "{:.4f}", "95% CI low": "{:.4f}", "95% CI high": "{:.4f}", "Days beating baseline": "{:.0%}"}),
-            hide_index=True, use_container_width=True)
+# Live section: isolated fragment, refreshes every 30 seconds without rerunning backtests.
+st.divider()
+st.subheader('Live forecast & log (30-second refresh)')
+st.caption('Latest *completed* 1-minute bar. IEX feed represents IEX trading only; SIP requires eligible access. Forecasts are experimental and are not orders.')
 
-        st.subheader("Pooled metrics (overlapping rows, descriptive only)")
-        pooled = pd.DataFrame([{"Horizon": f"{h} min", **m} for h, z in res.items() if (m := q.pooled_metrics(z))])
-        st.dataframe(pooled.style.format({c: "{:.1%}" for c in pooled.columns if c.startswith("%") or "ccuracy" in c or c == "Actionable %"}
-                                         | {"Log loss": "{:.3f}", "Prior log loss": "{:.3f}",
-                                            "Log-loss skill": "{:+.3f}", "Brier skill": "{:+.3f}"}),
-                     hide_index=True, use_container_width=True)
+@st.fragment(run_every="30s")
+def live_forecast():
+    live_key = st.secrets.get('ALPACA_API_KEY', '')
+    live_secret = st.secrets.get('ALPACA_SECRET_KEY', '')
+    live_feed = st.secrets.get('ALPACA_FEED', 'iex')
+    if not live_key or not live_secret:
+        st.info('Set ALPACA_API_KEY and ALPACA_SECRET_KEY in Streamlit Secrets to enable automatic live refresh.')
+        return
+    now = dt.datetime.now(dt.timezone.utc)
+    # End two minutes earlier to avoid relying on unfinished bars and free SIP delays.
+    end_dt = now - dt.timedelta(minutes=2)
+    start_dt = end_dt - dt.timedelta(days=45)
+    try:
+        raw = alpaca(start_dt.isoformat(), end_dt.isoformat(), live_feed, live_key, live_secret)
+        st.caption(f'Feed: {live_feed.upper()} | Last candle: {raw.index[-1].strftime("%Y-%m-%d %I:%M %p %Z")} | Refresh requested: 30 seconds')
+        st.metric('QQQ last completed close', f'${raw.close.iloc[-1]:.2f}')
+        if len(set(raw.index.date)) < 17:
+            st.warning('Not enough historical sessions to train forecasts. Need at least 17 regular sessions.')
+            return
+        feat = make_features(raw)
+        days = sorted(feat.session.unique())
+        latest_day = days[-1]
+        # Train on completed PRIOR sessions only; never use current-day outcomes.
+        train = feat[feat.session != latest_day]
+        latest = feat[feat.session == latest_day].iloc[[-1]]
+        if latest[FEATURES].notna().sum(axis=1).iloc[0] < 12:
+            st.warning('Insufficient features at latest candle.')
+            return
+        forecast_rows = []
+        for h in HORIZONS:
+            target = f'future_{h}'
+            tr = train.dropna(subset=[target])
+            tr = tr[tr[FEATURES].notna().sum(axis=1) >= 12]
+            threshold = {5:5,15:8,30:12,60:18}[h]
+            y = np.where(tr[target] > threshold,2,np.where(tr[target] < -threshold,0,1))
+            if len(np.unique(y)) < 3:
+                continue
+            model = make_pipeline(SimpleImputer(strategy='median'),StandardScaler(),LogisticRegression(max_iter=350))
+            model.fit(tr[FEATURES], y)
+            pp = model.predict_proba(latest[FEATURES])[0]
+            prob = np.zeros(3)
+            for j, cls in enumerate(model.classes_):
+                prob[int(cls)] = pp[j]
+            direction = ['DOWN','SIDEWAYS','UP'][int(np.argmax(prob))]
+            forecast_rows.append({'Horizon':f'{h} min','Forecast':direction,'P(DOWN)':prob[0], 'P(SIDEWAYS)':prob[1], 'P(UP)':prob[2]})
+        if forecast_rows:
+            st.dataframe(pd.DataFrame(forecast_rows).style.format({'P(DOWN)':'{:.1%}','P(SIDEWAYS)':'{:.1%}','P(UP)':'{:.1%}'}),hide_index=True,use_container_width=True)
+            st.caption('Probabilities are uncalibrated Version 2 logistic-regression estimates. Model trains only on prior completed sessions; refreshed data is polled every 30 seconds, but 1-minute bars change less frequently.')
+        else:
+            st.warning('Not enough class diversity to fit the current model.')
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else '?'
+        st.error(f'Alpaca HTTP {status}. Check credentials, subscription/feed and requested historical range. {exc}')
+    except Exception as exc:
+        st.error(f'Live refresh failed: {exc}')
 
-        h = st.selectbox("Horizon for detail", q.HORIZONS, index=1)
-        z = res[h]
-        daily = q.daily_metrics(z, cost_bps)
-        st.subheader(f"{h}-minute horizon: per-day detail")
-        st.dataframe(q.summarize_days(daily).style.format(FMT_SUM | {"Days": "{:.0f}"}), hide_index=True, use_container_width=True)
-        fig = go.Figure(go.Bar(x=daily.index.astype(str), y=daily.ll_gain,
-                               marker_color=["#2a9d8f" if v > 0 else "#e76f51" for v in daily.ll_gain]))
-        fig.update_layout(height=300, title="Log-loss gain vs prior baseline, by session (above 0 = model better)",
-                          margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-        with st.expander("Per-day table"):
-            st.dataframe(daily.style.format("{:.4f}"), use_container_width=True)
-
-        st.subheader("Calibration")
-        cal = q.calibration_table(z)
-        fig = go.Figure()
-        for cls, colr in (("UP", "#2a9d8f"), ("DOWN", "#e76f51")):
-            c = cal[cal["class"] == cls]
-            fig.add_trace(go.Scatter(x=c.mean_pred, y=c.observed, mode="lines+markers", name=cls,
-                                     line_color=colr, text=c.n, hovertemplate="pred %{x:.2f}, observed %{y:.2f}, n=%{text}"))
-        fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="perfect", line=dict(dash="dash", color="gray")))
-        fig.update_layout(height=340, xaxis_title="Predicted probability", yaxis_title="Observed frequency",
-                          margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-
-        scored = q.score_rows(z)
-        fwd = scored.groupby("prediction").agg(n=("future_bps", "size"), mean_fwd_bps=("future_bps", "mean"),
-                                               median_fwd_bps=("future_bps", "median"))
-        st.write("**Average forward return by predicted class (bps)**")
-        st.dataframe(fwd.style.format({"mean_fwd_bps": "{:.2f}", "median_fwd_bps": "{:.2f}"}), use_container_width=True)
-
-        st.subheader("Replay a session")
-        sessions = sorted(z.session.unique())
-        chosen = st.selectbox("Session", sessions, index=len(sessions) - 1)
-        day = z[z.session == chosen]
-        valid = day.dropna(subset=["actual"])
-        if len(valid):
-            st.write("**Confusion matrix** (actual rows, predicted columns)")
-            st.dataframe(pd.crosstab(valid.actual, valid.prediction, dropna=False))
-        st.dataframe(day.reset_index()[["timestamp", "close", "prediction", "confidence", "p_up", "p_down", "p_sideways",
-                                        "thr_bps", "future_bps", "actual"]].tail(60), hide_index=True, use_container_width=True)
-        cd = grid[(grid.session == chosen) & grid.close.notna()]
-        fig = go.Figure(go.Candlestick(x=cd.index, open=cd.open, high=cd.high, low=cd.low, close=cd.close))
-        fig.update_layout(height=420, xaxis_rangeslider_visible=False, title=f"QQQ {chosen} (ET)",
-                          margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-        st.download_button("Download all predictions CSV", pd.concat(res.values()).reset_index().to_csv(index=False).encode(),
-                           "QQQ_walkforward_predictions.csv", "text/csv")
-
-with tab_live:
-    st.write("Forward testing is the only evidence that is not contaminated by the choices made while building the model. "
-             "Each click trains on all **completed** sessions, predicts from the latest bar, and appends the forecast to the "
-             "log with its resolution time. Outcomes are filled in from later data, using the exact resolution minute only.")
-    if "x" not in st.session_state:
-        st.info("Run the walk-forward test first so data is loaded.")
-    else:
-        st.caption("Needs data that includes the latest completed bar (Alpaca source, or a freshly exported CSV). "
-                   "The live session is treated as in progress, and the walk-forward grid is rebuilt for it.")
-        c1, c2 = st.columns(2)
-        if c1.button("Log live forecast"):
-            try:
-                raw = load_raw()
-                g, _ = q.prepare(raw.reset_index(), live=True)
-                xl = q.make_features(g, k=k)
-                rows, skipped = q.predict_live(xl, k=k, min_train_days=min_train)
-                n = q.append_log(rows, LOG_PATH)
-                st.success(f"Latest bar {g.close.dropna().index.max():%Y-%m-%d %H:%M} ET · logged {n} new forecast(s).")
-                if rows:
-                    st.dataframe(pd.DataFrame(rows)[["bar_time", "horizon", "prediction", "confidence", "p_down", "p_sideways",
-                                                     "p_up", "thr_bps", "resolve_time"]], hide_index=True, use_container_width=True)
-                for hz, why in skipped:
-                    st.caption(f"{hz} min not predicted: {why}")
-            except Exception as e:
-                st.error(f"Live forecast failed: {e}")
-        if c2.button("Resolve outcomes"):
-            try:
-                g, _ = q.prepare(load_raw(), live=True)
-                st.write(q.resolve_log(LOG_PATH, g))
-            except Exception as e:
-                st.error(f"Could not resolve: {e}")
-    sc = q.summarize_log(LOG_PATH)
-    if not sc.empty:
-        st.subheader("Forward-test scorecard (resolved forecasts only)")
-        st.dataframe(sc.style.format({c: "{:.1%}" for c in sc.columns if c.startswith("%") or "ccuracy" in c or c == "Actionable %"}
-                                     | {"Log loss": "{:.3f}", "Prior log loss": "{:.3f}",
-                                        "Log-loss skill": "{:+.3f}", "Brier skill": "{:+.3f}"}),
-                     hide_index=True, use_container_width=True)
-    if os.path.exists(LOG_PATH):
-        st.download_button("Download prediction log", open(LOG_PATH, "rb").read(), "live_predictions.csv", "text/csv")
-        st.caption("Streamlit Community Cloud storage is ephemeral. Download the log regularly, or run `python live_log.py` "
-                   "on a machine you control to keep a permanent record.")
+live_forecast()
