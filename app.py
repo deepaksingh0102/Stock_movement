@@ -19,7 +19,15 @@ FEATURES = ['ret1','ret5','ret15','ema_spread','ema50_gap','vwap_gap','rsi','mac
 def clean(raw):
     x = raw.copy()
     if 'timestamp' in x.columns:
-        x['timestamp'] = pd.to_datetime(x['timestamp'], utc=True)
+        parsed = pd.to_datetime(x["timestamp"], errors="coerce")
+if parsed.dt.tz is None:
+    x["timestamp"] = parsed.dt.tz_localize(
+        "America/New_York"
+    )
+else:
+    x["timestamp"] = parsed.dt.tz_convert(
+        "America/New_York"
+    )
         x = x.set_index('timestamp')
     if x.index.tz is None:
         x.index = x.index.tz_localize('UTC')
@@ -145,37 +153,104 @@ def metrics(pred):
 
 st.title('QQQ | Intraday Prediction & Walk-forward Validation')
 st.caption('Research tool only. Predictions are statistical estimates, not guarantees. No order execution.')
+# Read credentials automatically from Streamlit Secrets
+API_KEY = st.secrets.get("ALPACA_API_KEY", "")
+API_SECRET = st.secrets.get("ALPACA_SECRET_KEY", "")
+DEFAULT_FEED = st.secrets.get("ALPACA_FEED", "iex")
+
+CHART_WINDOWS = {
+    "5 minutes": 5,
+    "15 minutes": 15,
+    "1 hour": 60,
+    "2 hours": 120,
+    "3 hours": 180,
+    "4 hours": 240,
+    "Since market open": None,
+}
+
 with st.sidebar:
-    st.header('Data')
-    source=st.radio('Source',['Upload CSV','Alpaca API'],index=1)
-    if source=='Upload CSV':
-        uploaded=st.file_uploader('QQQ 1-minute CSV',type=['csv'])
-    else:
-        start=st.date_input('Start',dt.date.today()-dt.timedelta(days=75))
-        end=st.date_input('End (exclusive)',dt.date.today()+dt.timedelta(days=1))
-        feed=st.selectbox('Feed',['iex','sip'])
-        key=st.text_input('Alpaca key',value=st.secrets.get('ALPACA_API_KEY',''),type='password')
-        secret=st.text_input('Alpaca secret',value=st.secrets.get('ALPACA_SECRET_KEY',''),type='password')
-    min_train=st.slider('Initial training sessions',10,35,15)
-    refit=st.slider('Refit every N sessions',1,10,5)
-    run=st.button('Run walk-forward test',type='primary')
+    st.header("QQQ Live Chart")
+
+    chart_window = st.selectbox(
+        "Chart timeframe",
+        list(CHART_WINDOWS.keys()),
+        index=6,
+    )
+
+    feed = st.selectbox(
+        "Feed",
+        ["iex", "sip"],
+        index=0 if DEFAULT_FEED == "iex" else 1,
+    )
+
+    st.caption("Auto-refresh: every 30 seconds")
+
+    st.divider()
+    st.header("Historical Validation")
+
+    uploaded = st.file_uploader(
+        "Optional: QQQ 1-minute CSV",
+        type=["csv"],
+    )
+
+    min_train = st.slider(
+        "Initial training sessions", 10, 35, 15
+    )
+    refit = st.slider(
+        "Refit every N sessions", 1, 10, 5
+    )
+
+    run = st.button(
+        "Run walk-forward test", type="primary"
+    )
+
+if not API_KEY or not API_SECRET:
+    st.warning(
+        "Missing Alpaca credentials. "
+        "Configure them in Streamlit Settings > Secrets."
+    )
 
 if run:
     try:
-        if source=='Upload CSV':
-            if uploaded is None: st.error('Upload a CSV first.'); st.stop()
-            raw=clean(pd.read_csv(uploaded))
+        if uploaded is not None:
+            raw = clean(pd.read_csv(uploaded))
         else:
-            if not key or not secret: st.error('Provide Alpaca credentials.'); st.stop()
-            raw=alpaca(dt.datetime.combine(start,dt.time.min,dt.timezone.utc).isoformat(),dt.datetime.combine(end,dt.time.min,dt.timezone.utc).isoformat(),feed,key,secret)
-        st.session_state['raw']=raw
-        with st.spinner('Computing features and walk-forward forecasts...'):
-            feat=make_features(raw)
-            results={h:fit_predict(feat,h,min_train,refit) for h in HORIZONS}
-        st.session_state['results']=results
-    except Exception as e:
-        st.error(f'Unable to complete test: {e}')
+            if not API_KEY or not API_SECRET:
+                raise ValueError(
+                    "Alpaca credentials missing from Secrets."
+                )
 
+            now = (
+                dt.datetime.now(dt.timezone.utc)
+                - dt.timedelta(minutes=2)
+            )
+
+            raw = alpaca(
+                (now - dt.timedelta(days=75)).isoformat(),
+                now.isoformat(),
+                feed,
+                API_KEY,
+                API_SECRET,
+            )
+
+        if raw.empty:
+            raise ValueError(
+                "No regular-session QQQ bars returned."
+            )
+
+        st.session_state["raw"] = raw
+
+        with st.spinner("Running walk-forward test..."):
+            feat = make_features(raw)
+            results = {
+                h: fit_predict(feat, h, min_train, refit)
+                for h in HORIZONS
+            }
+
+        st.session_state["results"] = results
+
+    except Exception as exc:
+        st.error(f"Unable to complete test: {exc}")
 if 'results' in st.session_state:
     results=st.session_state['results']; raw=st.session_state['raw']
     st.write(f'**QQQ data:** {raw.index.min()} through {raw.index.max()} | {len(raw):,} minute bars | {len(set(raw.index.date))} sessions')
@@ -211,65 +286,169 @@ else:
     st.info('Upload the existing QQQ 1-minute CSV or connect Alpaca, then click Run walk-forward test. This upgrades your existing Streamlit app; no second app is needed.')
 
 
-# Live section: isolated fragment, refreshes every 30 seconds without rerunning backtests.
 st.divider()
-st.subheader('Live forecast & log (30-second refresh)')
-st.caption('Latest *completed* 1-minute bar. IEX feed represents IEX trading only; SIP requires eligible access. Forecasts are experimental and are not orders.')
+st.subheader("QQQ Live Chart & Forecast")
 
 @st.fragment(run_every="30s")
 def live_forecast():
-    live_key = st.secrets.get('ALPACA_API_KEY', '')
-    live_secret = st.secrets.get('ALPACA_SECRET_KEY', '')
-    live_feed = st.secrets.get('ALPACA_FEED', 'iex')
-    if not live_key or not live_secret:
-        st.info('Set ALPACA_API_KEY and ALPACA_SECRET_KEY in Streamlit Secrets to enable automatic live refresh.')
+    if not API_KEY or not API_SECRET:
+        st.info("Configure Alpaca keys in Streamlit Secrets.")
         return
-    now = dt.datetime.now(dt.timezone.utc)
-    # End two minutes earlier to avoid relying on unfinished bars and free SIP delays.
-    end_dt = now - dt.timedelta(minutes=2)
-    start_dt = end_dt - dt.timedelta(days=45)
+
     try:
-        raw = alpaca(start_dt.isoformat(), end_dt.isoformat(), live_feed, live_key, live_secret)
-        st.caption(f'Feed: {live_feed.upper()} | Last candle: {raw.index[-1].strftime("%Y-%m-%d %I:%M %p %Z")} | Refresh requested: 30 seconds')
-        st.metric('QQQ last completed close', f'${raw.close.iloc[-1]:.2f}')
+        now = dt.datetime.now(dt.timezone.utc)
+        end_dt = now - dt.timedelta(minutes=2)
+
+        raw = alpaca(
+            (end_dt - dt.timedelta(days=45)).isoformat(),
+            end_dt.isoformat(),
+            feed,
+            API_KEY,
+            API_SECRET,
+        )
+
+        latest = raw.iloc[-1]
+        last_ts = raw.index[-1]
+
+        st.metric(
+            "QQQ Latest Completed Close",
+            f"${latest.close:.2f}",
+        )
+
+        st.caption(
+            f"Feed: {feed.upper()} | "
+            f"Last candle: {last_ts}"
+        )
+
+        # Select the most recent regular trading session
+        session_data = raw[
+            raw.index.date == last_ts.date()
+        ]
+
+        window_minutes = CHART_WINDOWS[chart_window]
+
+        if window_minutes is None:
+            chart_data = session_data
+        else:
+            chart_data = session_data.tail(window_minutes)
+
+        fig = go.Figure(
+            go.Candlestick(
+                x=chart_data.index,
+                open=chart_data.open,
+                high=chart_data.high,
+                low=chart_data.low,
+                close=chart_data.close,
+                name="QQQ",
+            )
+        )
+
+        fig.update_layout(
+            height=480,
+            xaxis_rangeslider_visible=False,
+            title=f"QQQ - {chart_window} (Eastern)",
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Generate forecasts using the original V2 model
         if len(set(raw.index.date)) < 17:
-            st.warning('Not enough historical sessions to train forecasts. Need at least 17 regular sessions.')
+            st.warning(
+                "At least 17 historical sessions are needed."
+            )
             return
+
         feat = make_features(raw)
-        days = sorted(feat.session.unique())
-        latest_day = days[-1]
-        # Train on completed PRIOR sessions only; never use current-day outcomes.
+
+        latest_day = feat.session.iloc[-1]
         train = feat[feat.session != latest_day]
-        latest = feat[feat.session == latest_day].iloc[[-1]]
-        if latest[FEATURES].notna().sum(axis=1).iloc[0] < 12:
-            st.warning('Insufficient features at latest candle.')
+        latest_features = feat.iloc[[-1]]
+
+        if (
+            latest_features[FEATURES]
+            .notna()
+            .sum(axis=1)
+            .iloc[0] < 12
+        ):
+            st.warning("Insufficient features.")
             return
-        forecast_rows = []
+
+        forecasts = []
+
         for h in HORIZONS:
-            target = f'future_{h}'
-            tr = train.dropna(subset=[target])
-            tr = tr[tr[FEATURES].notna().sum(axis=1) >= 12]
-            threshold = {5:5,15:8,30:12,60:18}[h]
-            y = np.where(tr[target] > threshold,2,np.where(tr[target] < -threshold,0,1))
+            target = f"future_{h}"
+
+            tr = train.dropna(subset=[target]).copy()
+            tr = tr[
+                tr[FEATURES].notna().sum(axis=1) >= 12
+            ]
+
+            threshold = {
+                5: 5,
+                15: 8,
+                30: 12,
+                60: 18,
+            }[h]
+
+            y = np.where(
+                tr[target] > threshold,
+                2,
+                np.where(tr[target] < -threshold, 0, 1),
+            )
+
             if len(np.unique(y)) < 3:
                 continue
-            model = make_pipeline(SimpleImputer(strategy='median'),StandardScaler(),LogisticRegression(max_iter=350))
+
+            model = make_pipeline(
+                SimpleImputer(strategy="median"),
+                StandardScaler(),
+                LogisticRegression(max_iter=350),
+            )
+
             model.fit(tr[FEATURES], y)
-            pp = model.predict_proba(latest[FEATURES])[0]
-            prob = np.zeros(3)
+
+            p = model.predict_proba(
+                latest_features[FEATURES]
+            )[0]
+
+            probs = np.zeros(3)
+
             for j, cls in enumerate(model.classes_):
-                prob[int(cls)] = pp[j]
-            direction = ['DOWN','SIDEWAYS','UP'][int(np.argmax(prob))]
-            forecast_rows.append({'Horizon':f'{h} min','Forecast':direction,'P(DOWN)':prob[0], 'P(SIDEWAYS)':prob[1], 'P(UP)':prob[2]})
-        if forecast_rows:
-            st.dataframe(pd.DataFrame(forecast_rows).style.format({'P(DOWN)':'{:.1%}','P(SIDEWAYS)':'{:.1%}','P(UP)':'{:.1%}'}),hide_index=True,use_container_width=True)
-            st.caption('Probabilities are uncalibrated Version 2 logistic-regression estimates. Model trains only on prior completed sessions; refreshed data is polled every 30 seconds, but 1-minute bars change less frequently.')
-        else:
-            st.warning('Not enough class diversity to fit the current model.')
+                probs[int(cls)] = p[j]
+
+            direction = ["DOWN", "SIDEWAYS", "UP"][
+                int(np.argmax(probs))
+            ]
+
+            forecasts.append({
+                "Horizon": f"{h} min",
+                "Forecast": direction,
+                "P(DOWN)": probs[0],
+                "P(SIDEWAYS)": probs[1],
+                "P(UP)": probs[2],
+            })
+
+        if forecasts:
+            st.dataframe(
+                pd.DataFrame(forecasts).style.format({
+                    "P(DOWN)": "{:.1%}",
+                    "P(SIDEWAYS)": "{:.1%}",
+                    "P(UP)": "{:.1%}",
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            st.caption(
+                "Uncalibrated Version 2 probabilities. "
+                "Market data refreshes every 30 seconds."
+            )
+
     except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else '?'
-        st.error(f'Alpaca HTTP {status}. Check credentials, subscription/feed and requested historical range. {exc}')
+        st.error(f"Alpaca API error: {exc}")
+
     except Exception as exc:
-        st.error(f'Live refresh failed: {exc}')
+        st.error(f"Live refresh failed: {exc}")
+
 
 live_forecast()
