@@ -1198,6 +1198,148 @@ if "backtest_results" in st.session_state:
 
 
 # ============================================================
+# HISTORICAL QQQ CHART REPLAY - CSV OR BACKTEST DATA
+# ============================================================
+
+st.divider()
+with st.expander("Historical QQQ chart replay + price-action patterns", expanded=True):
+    st.caption(
+        "Upload your existing QQQ_1min_60d.csv in the sidebar, "
+        "or click Run walk-forward test to load Alpaca data. "
+        "This replay does not place trades."
+    )
+    replay_raw = None
+    if uploaded is not None:
+        try:
+            # Re-read the uploaded CSV independently of the backtest button.
+            replay_raw = clean(pd.read_csv(uploaded))
+        except Exception as exc:
+            st.error(f"CSV could not be read: {exc}")
+    elif "backtest_raw" in st.session_state:
+        replay_raw = st.session_state["backtest_raw"]
+
+    if replay_raw is None or replay_raw.empty:
+        st.info("Upload the 60-day QQQ CSV in the sidebar to view historical charts.")
+    else:
+        replay_days = sorted(set(replay_raw.index.date))
+        replay_day = st.selectbox(
+            "Trading day", replay_days, index=len(replay_days) - 1,
+            key="replay_day"
+        )
+        replay_window = st.selectbox(
+            "Historical chart timeframe",
+            list(CHART_WINDOWS),
+            index=6,
+            key="replay_window"
+        )
+        show_replay_patterns = st.checkbox(
+            "Display bullish/bearish pattern markers", value=True,
+            key="replay_patterns"
+        )
+        show_replay_levels = st.checkbox(
+            "Display rolling support/resistance", value=True,
+            key="replay_levels"
+        )
+
+        # Features are calculated on all sessions, preserving EMA history.
+        replay_features = make_features(replay_raw)
+        replay_day_data = replay_features[
+            replay_features.index.date == replay_day
+        ].copy()
+        replay_patterns_all = detect_price_patterns(replay_raw)
+        replay_patterns = replay_patterns_all[
+            replay_patterns_all.index.date == replay_day
+        ].copy() if not replay_patterns_all.empty else pd.DataFrame()
+
+        window_size = CHART_WINDOWS[replay_window]
+        if window_size is not None:
+            replay_day_data = replay_day_data.tail(window_size)
+
+        if replay_day_data.empty:
+            st.warning("No regular-session candles on this day.")
+        else:
+            chart_end = replay_day_data.index[-1] + pd.Timedelta(minutes=1)
+            chart_start = replay_day_data.index[0]
+            chart = go.Figure()
+            chart.add_trace(go.Candlestick(
+                x=replay_day_data.index,
+                open=replay_day_data["open"],
+                high=replay_day_data["high"],
+                low=replay_day_data["low"],
+                close=replay_day_data["close"],
+                name="QQQ"
+            ))
+            for col, color in [
+                ("ema9", "orange"),
+                ("ema20", "blue"),
+                ("vwap", "purple")
+            ]:
+                chart.add_trace(go.Scatter(
+                    x=replay_day_data.index,
+                    y=replay_day_data[col],
+                    mode="lines", name=col.upper(),
+                    line=dict(color=color, width=1.5)
+                ))
+
+            if not replay_patterns.empty:
+                # Only show events whose 5-minute candle had completed.
+                visible = replay_patterns[
+                    (replay_patterns["detected_at"] >= chart_start) &
+                    (replay_patterns["detected_at"] <= chart_end)
+                ].copy()
+                if show_replay_patterns:
+                    for direction, symbol, color, offset in [
+                        ("BULLISH", "triangle-up", "green", 0.9995),
+                        ("BEARISH", "triangle-down", "red", 1.0005)
+                    ]:
+                        matched = visible[
+                            (visible["direction"] == direction) &
+                            (visible["pattern"] != "")
+                        ]
+                        level_col = "low" if direction == "BULLISH" else "high"
+                        chart.add_trace(go.Scatter(
+                            x=matched["detected_at"],
+                            y=matched[level_col] * offset,
+                            text=matched["pattern"],
+                            mode="markers", name=f"{direction} pattern",
+                            marker=dict(symbol=symbol, color=color, size=12),
+                            hovertemplate="%{text}<br>%{x}<extra></extra>"
+                        ))
+                if show_replay_levels and not visible.empty:
+                    last = visible.iloc[-1]
+                    for col, color in [
+                        ("support", "green"),
+                        ("resistance", "red")
+                    ]:
+                        if pd.notna(last[col]):
+                            chart.add_hline(
+                                y=float(last[col]), line_color=color,
+                                line_dash="dash",
+                                annotation_text=f"{col.title()}: ${last[col]:.2f}"
+                            )
+
+            chart.update_layout(
+                title=f"QQQ historical replay - {replay_day}",
+                height=550,
+                xaxis_rangeslider_visible=False,
+                xaxis_title="Eastern Time",
+                yaxis_title="QQQ price ($)"
+            )
+            st.plotly_chart(chart, use_container_width=True)
+            if not replay_patterns.empty:
+                events = replay_patterns[
+                    (replay_patterns["pattern"] != "") &
+                    (replay_patterns["detected_at"] <= chart_end)
+                ]
+                st.caption(f"Detected price-action events through chart end: {len(events)}")
+                if not events.empty:
+                    st.dataframe(
+                        events[["detected_at", "pattern", "direction", "close",
+                                "support", "resistance", "volume_ratio"]].tail(30),
+                        use_container_width=True
+                    )
+
+# ============================================================
 # LIVE FORECAST - REFRESH EVERY 30 SECONDS
 # ============================================================
 
@@ -1208,18 +1350,14 @@ st.subheader("QQQ Live Chart & Forecast")
 def live_dashboard():
 
     if not API_KEY or not API_SECRET:
-        st.warning(
-            "Missing Alpaca credentials. "
-            "Configure Streamlit Secrets."
-        )
+        st.warning("Missing Alpaca credentials.")
         return
 
     try:
-        # ====================================================
-        # 1. LOAD ALPACA MARKET DATA
-        # ====================================================
-
         now_ny = dt.datetime.now(NY)
+
+        # Use midnight of current New York date
+        # as the boundary for completed sessions.
         today = now_ny.date()
 
         with st.spinner("Loading QQQ market data..."):
@@ -1232,18 +1370,15 @@ def live_dashboard():
             recent = get_live_data(feed)
 
             raw = combine_data(
-                history,
-                recent
+                history, recent
             )
 
         if raw.empty:
-            st.warning(
-                "No QQQ market data available."
-            )
+            st.warning("No QQQ market data available")
             return
 
         latest_ts = raw.index[-1]
-        latest_close = float(raw["close"].iloc[-1])
+        latest_close = raw["close"].iloc[-1]
 
         st.metric(
             "QQQ Latest Completed Close",
@@ -1253,7 +1388,7 @@ def live_dashboard():
         st.caption(
             f"Feed: {feed.upper()} | "
             f"Latest candle: {latest_ts} | "
-            "Refresh: every 30 seconds"
+            "Refresh: 30 seconds"
         )
 
         age_minutes = (
@@ -1264,35 +1399,25 @@ def live_dashboard():
             st.warning(
                 f"Latest candle is {age_minutes:.0f} "
                 "minutes old. Market may be closed "
-                "or market data may be delayed."
+                "or data may be delayed."
             )
 
-        # ====================================================
-        # 2. CALCULATE TECHNICAL INDICATORS
-        # ====================================================
-
         features = make_features(raw)
+
+        # ====================================================
+        # CHART
+        # ====================================================
 
         latest_day = latest_ts.date()
 
         chart_data = features[
             features.index.date == latest_day
-        ].copy()
+        ]
 
         window = CHART_WINDOWS[chart_window]
 
         if window is not None:
             chart_data = chart_data.tail(window)
-
-        if chart_data.empty:
-            st.warning(
-                "No QQQ candles available for chart."
-            )
-            return
-
-        # ====================================================
-        # 3. CREATE QQQ CANDLESTICK CHART
-        # ====================================================
 
         fig = go.Figure()
 
@@ -1307,7 +1432,6 @@ def live_dashboard():
             )
         )
 
-        # EMA9, EMA20, VWAP overlays
         for name, color in [
             ("ema9", "orange"),
             ("ema20", "blue"),
@@ -1325,210 +1449,120 @@ def live_dashboard():
                     )
                 )
             )
-
-        # ====================================================
-        # 4. DETECT PRICE ACTION PATTERNS
-        # ====================================================
+        # ============================================================
+        # ADD PRICE ACTION PATTERNS TO QQQ CHART
+        # ============================================================
 
         patterns = detect_price_patterns(raw)
 
         if not patterns.empty:
-
+            # Only show patterns from the chart's trading day.
             patterns = patterns[
                 patterns.index.date == latest_day
             ].copy()
 
-            # A pattern becomes available only after
-            # its complete 5-minute candle closes.
-            # latest_ts is the start of the last
-            # completed 1-minute candle.
-            available_through = (
-                latest_ts + pd.Timedelta(minutes=1)
-            )
-
+            # The latest five-minute candle must be complete.
             patterns = patterns[
-                patterns["detected_at"]
-                <= available_through
-            ].copy()
-
-        # ====================================================
-        # 5. ADD BULLISH AND BEARISH MARKERS
-        # ====================================================
-
-        if show_patterns and not patterns.empty:
-
-            detected = patterns[
-                patterns["pattern"] != ""
-            ].copy()
-
-            detected = detected[
-                detected["detected_at"]
-                >= chart_data.index.min()
+                patterns["detected_at"] <= latest_ts
             ]
 
-            bullish = detected[
-                detected["direction"] == "BULLISH"
-            ]
-
-            bearish = detected[
-                detected["direction"] == "BEARISH"
-            ]
-
-            # Bullish patterns
-            fig.add_trace(
-                go.Scatter(
-                    x=bullish["detected_at"],
-                    y=bullish["low"] * 0.9995,
-                    mode="markers",
-                    name="Bullish Pattern",
-                    marker=dict(
-                        symbol="triangle-up",
-                        size=13,
-                        color="green"
-                    ),
-                    text=bullish["pattern"],
-                    hovertemplate=(
-                        "<b>%{text}</b>"
-                        "<br>Time: %{x}"
-                        "<br>Price: $%{y:.2f}"
-                        "<extra></extra>"
-                    )
-                )
-            )
-
-            # Bearish patterns
-            fig.add_trace(
-                go.Scatter(
-                    x=bearish["detected_at"],
-                    y=bearish["high"] * 1.0005,
-                    mode="markers",
-                    name="Bearish Pattern",
-                    marker=dict(
-                        symbol="triangle-down",
-                        size=13,
-                        color="red"
-                    ),
-                    text=bearish["pattern"],
-                    hovertemplate=(
-                        "<b>%{text}</b>"
-                        "<br>Time: %{x}"
-                        "<br>Price: $%{y:.2f}"
-                        "<extra></extra>"
-                    )
-                )
-            )
-
-        # ====================================================
-        # 6. SUPPORT AND RESISTANCE
-        # ====================================================
-
-        if show_levels and not patterns.empty:
-
-            latest_pattern = patterns.iloc[-1]
-
-            for column, color, label in [
-                ("support", "green", "Support"),
-                ("resistance", "red", "Resistance")
-            ]:
-
-                level = latest_pattern[column]
-
-                if pd.notna(level):
-                    fig.add_hline(
-                        y=float(level),
-                        line_color=color,
-                        line_dash="dash",
-                        annotation_text=(
-                            f"{label}: ${level:.2f}"
-                        ),
-                        annotation_position="top right"
-                    )
-
-        # ====================================================
-        # 7. DISPLAY CHART
-        # ====================================================
-
-        fig.update_layout(
-            height=550,
-            title=f"QQQ - {chart_window}",
-            xaxis_title="Eastern Time",
-            yaxis_title="QQQ Price ($)",
-            xaxis_rangeslider_visible=False,
-            hovermode="x unified",
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="left",
-                x=0
-            )
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
-
-        # ====================================================
-        # 8. DISPLAY PRICE ACTION PATTERN TABLE
-        # ====================================================
-
-        if show_pattern_table:
-
-            st.subheader(
-                "QQQ Price Action Pattern Recognition"
-            )
-
-            if patterns.empty:
-                st.info(
-                    "No completed 5-minute pattern "
-                    "data available yet."
-                )
-
-            else:
-                events = patterns[
+            # Use event time, not the start of the candle.
+            if show_patterns:
+                detected = patterns[
                     patterns["pattern"] != ""
                 ].copy()
 
-                if events.empty:
-                    st.info(
-                        "No qualifying price-action "
-                        "patterns detected."
-                    )
+                if not chart_data.empty:
+                    detected = detected[
+                        detected["detected_at"] >= chart_data.index.min()
+                    ]
 
-                else:
-                    events = events[[
-                        "detected_at",
-                        "close",
-                        "pattern",
-                        "direction",
-                        "support",
-                        "resistance",
-                        "volume_ratio"
-                    ]].tail(20)
+                bullish = detected[
+                    detected["direction"] == "BULLISH"
+                ]
 
-                    st.dataframe(
-                        events,
-                        use_container_width=True
-                    )
+                bearish = detected[
+                    detected["direction"] == "BEARISH"
+                ]
 
-                    latest_event = events.iloc[-1]
-
-                    direction = latest_event["direction"]
-                    name = latest_event["pattern"]
-
-                    if direction == "BULLISH":
-                        st.success(
-                            f"Latest bullish pattern: {name}"
+                fig.add_trace(
+                    go.Scatter(
+                        x=bullish["detected_at"],
+                        y=bullish["low"] * 0.9995,
+                        mode="markers",
+                        name="Bullish pattern",
+                        marker=dict(
+                            symbol="triangle-up",
+                            size=12,
+                            color="green"
+                        ),
+                        text=bullish["pattern"],
+                        hovertemplate=(
+                            "%{text}<br>"
+                            "%{x}<br>"
+                            "Price: %{y:.2f}"
+                            "<extra></extra>"
                         )
+                    )
+                )
 
-                    elif direction == "BEARISH":
-                        st.error(
-                            f"Latest bearish pattern: {name}"
+                fig.add_trace(
+                    go.Scatter(
+                        x=bearish["detected_at"],
+                        y=bearish["high"] * 1.0005,
+                        mode="markers",
+                        name="Bearish pattern",
+                        marker=dict(
+                            symbol="triangle-down",
+                            size=12,
+                            color="red"
+                        ),
+                        text=bearish["pattern"],
+                        hovertemplate=(
+                            "%{text}<br>"
+                            "%{x}<br>"
+                            "Price: %{y:.2f}"
+                            "<extra></extra>"
                         )
+                    )
+                )
+
+            if show_levels and not chart_data.empty:
+                latest_pattern = patterns.iloc[-1] if len(patterns) else None
+
+                if latest_pattern is not None:
+                    for column, color, label in [
+                        ("support", "green", "Support"),
+                        ("resistance", "red", "Resistance")
+                    ]:
+                        level = latest_pattern[column]
+
+                        if pd.notna(level):
+                            fig.add_hline(
+                                y=float(level),
+                                line_color=color,
+                                line_dash="dash",
+                                annotation_text=(
+                                    f"{label}: ${level:.2f}"
+                                ),
+                                annotation_position="top right"
+                            )
+
+        fig.update_layout(height=520, xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+        if show_pattern_table and not patterns.empty:
+            st.subheader("QQQ Price Action Patterns")
+            events = patterns[patterns["pattern"] != ""].copy()
+            if events.empty:
+                st.info("No qualifying price-action patterns detected in the available session.")
+            else:
+                events = events[["detected_at", "close", "pattern", "direction", "support", "resistance", "volume_ratio"]].tail(20)
+                st.dataframe(events, use_container_width=True)
+                latest_event = events.iloc[-1]
+                st.caption(f"Most recent pattern: {latest_event['pattern']} ({latest_event['direction']})")
 
         # ====================================================
-        # 9. TRAIN OR REUSE CACHED ML MODELS
+        # MODEL TRAINING - COMPLETED SESSIONS ONLY
         # ====================================================
 
         days = sorted(
@@ -1537,35 +1571,26 @@ def live_dashboard():
 
         if len(days) < 17:
             st.warning(
-                "At least 17 historical trading "
-                "sessions are required."
+                "At least 17 trading sessions "
+                "are required for model training."
             )
             return
 
-        # Exclude the latest session from training
-        # to prevent training on the session
-        # being forecast.
         training_days = days[:-1]
 
         training_df = features[
             features["session"].isin(
                 training_days
             )
-        ].copy()
+        ]
 
-        if training_df.empty:
-            st.warning(
-                "No training data available."
-            )
-            return
-
-        # Cache key changes when training data changes.
+        # Create a stable model cache key.
+        # Changes when completed training data changes.
         training_signature = (
-            f"{feed}|"
-            f"{training_days[-1]}|"
+            f"{feed}|{training_days[-1]}|"
             f"{len(training_df)}|"
-            f"{training_df['close'].iloc[-1]:.6f}|"
-            f"{training_df['volume'].sum():.0f}"
+            f"{training_df.close.iloc[-1]:.6f}|"
+            f"{training_df.volume.sum():.0f}"
         )
 
         training_key = hashlib.sha256(
@@ -1577,14 +1602,8 @@ def live_dashboard():
             training_df
         )
 
-        if not models:
-            st.warning(
-                "No trained models available."
-            )
-            return
-
         # ====================================================
-        # 10. GENERATE QQQ FORECASTS
+        # FORECAST
         # ====================================================
 
         forecast_df = forecast_latest(
@@ -1593,44 +1612,40 @@ def live_dashboard():
             min_confidence
         )
 
-        st.subheader(
-            "QQQ Intraday Predictions"
-        )
-
         if forecast_df.empty:
             st.warning(
                 "No valid forecasts available."
             )
+            return
 
-        else:
-            st.dataframe(
-                forecast_df.style.format({
-                    "Confidence": "{:.1%}",
-                    "P(DOWN)": "{:.1%}",
-                    "P(SIDEWAYS)": "{:.1%}",
-                    "P(UP)": "{:.1%}"
-                }),
-                hide_index=True,
-                use_container_width=True
-            )
+        st.subheader("QQQ Intraday Predictions")
 
-            st.caption(
-                "Forecast horizons: 5, 15, 30, "
-                "and 60 minutes. "
-                "Low-confidence directional "
-                "signals are labeled WAIT. "
-                "Probabilities are uncalibrated."
-            )
+        st.dataframe(
+            forecast_df.style.format({
+                "Confidence": "{:.1%}",
+                "P(DOWN)": "{:.1%}",
+                "P(SIDEWAYS)": "{:.1%}",
+                "P(UP)": "{:.1%}"
+            }),
+            hide_index=True,
+            use_container_width=True
+        )
+
+        st.caption(
+            "UP/DOWN predictions below the "
+            "selected confidence threshold "
+            "are labeled WAIT. SIDEWAYS remains "
+            "a separate predicted class. "
+            "Probabilities are uncalibrated."
+        )
 
         # ====================================================
-        # 11. CURRENT INDICATOR ALIGNMENT
+        # INDICATOR SNAPSHOT
         # ====================================================
 
         latest = features.iloc[-1]
 
-        st.subheader(
-            "Current QQQ Indicator Alignment"
-        )
+        st.subheader("Current Indicator Alignment")
 
         indicators = {
             "Price": latest["close"],
@@ -1643,97 +1658,18 @@ def live_dashboard():
             "Relative volume": latest["rvol"]
         }
 
-        indicator_df = pd.DataFrame([
-            {
-                "Indicator": name,
-                "Value": value
-            }
-            for name, value in indicators.items()
-        ])
+        indicator_df = pd.DataFrame(
+            [
+                {"Indicator": k, "Value": v}
+                for k, v in indicators.items()
+            ]
+        )
 
         st.dataframe(
             indicator_df,
             hide_index=True,
             use_container_width=True
         )
-
-        # ====================================================
-        # 12. INTERPRET BULLISH/BEARISH ALIGNMENT
-        # ====================================================
-
-        bullish_checks = {
-            "Price above VWAP":
-                latest["close"] > latest["vwap"],
-
-            "EMA9 above EMA20":
-                latest["ema9"] > latest["ema20"],
-
-            "RSI above 50":
-                latest["rsi"] > 50,
-
-            "MACD histogram positive":
-                latest["macd_hist"] > 0,
-
-            "ADX above 20":
-                latest["adx"] > 20,
-
-            "Relative volume above 1":
-                latest["rvol"] > 1
-        }
-
-        bearish_checks = {
-            "Price below VWAP":
-                latest["close"] < latest["vwap"],
-
-            "EMA9 below EMA20":
-                latest["ema9"] < latest["ema20"],
-
-            "RSI below 50":
-                latest["rsi"] < 50,
-
-            "MACD histogram negative":
-                latest["macd_hist"] < 0,
-
-            "ADX above 20":
-                latest["adx"] > 20,
-
-            "Relative volume above 1":
-                latest["rvol"] > 1
-        }
-
-        bullish_count = sum(
-            bool(v) for v in bullish_checks.values()
-        )
-
-        bearish_count = sum(
-            bool(v) for v in bearish_checks.values()
-        )
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.metric(
-                "Bullish Alignment",
-                f"{bullish_count}/6"
-            )
-
-        with col2:
-            st.metric(
-                "Bearish Alignment",
-                f"{bearish_count}/6"
-            )
-
-        st.caption(
-            "ADX and relative volume indicate "
-            "trend strength and participation, "
-            "not bullish or bearish direction. "
-            "These counts are descriptive, "
-            "not calibrated probabilities."
-        )
-
-    # ========================================================
-    # ERROR HANDLING
-    # ========================================================
 
     except requests.HTTPError as exc:
         st.error(
@@ -1742,9 +1678,8 @@ def live_dashboard():
 
     except Exception as exc:
         st.error(
-            f"Live dashboard error: {exc}"
+            f"Live refresh failed: {exc}"
         )
 
 
-# Start live dashboard
 live_dashboard()
