@@ -777,7 +777,210 @@ def calculate_metrics(predictions):
         ).mean()
     }
 
+# ============================================================
+# PRICE ACTION PATTERN RECOGNITION
+# ============================================================
 
+def detect_price_patterns(raw):
+    """
+    Detect price-action events on completed 5-minute
+    QQQ candles.
+
+    Uses only current and prior candles.
+    No future price data is used.
+    """
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    # Work within individual regular trading sessions.
+    pieces = []
+
+    for session_date, day in raw.groupby(raw.index.date):
+        bars = day.resample(
+            "5min",
+            origin="start_day",
+            label="left",
+            closed="left"
+        ).agg({
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+            "volume": "sum"
+        }).dropna()
+
+        # Only include completed five-minute candles.
+        counts = day["close"].resample(
+            "5min",
+            origin="start_day"
+        ).count()
+
+        bars = bars[counts.reindex(
+            bars.index, fill_value=0
+        ) == 5].copy()
+
+        if not bars.empty:
+            pieces.append(bars)
+
+    if not pieces:
+        return pd.DataFrame()
+
+    x = pd.concat(pieces).sort_index()
+
+    session = pd.Series(x.index.date, index=x.index)
+
+    def prior(s, n=1):
+        return s.groupby(session).shift(n)
+
+    o = x["open"]
+    h = x["high"]
+    l = x["low"]
+    c = x["close"]
+
+    body = (c - o).abs()
+    candle_range = (h - l).replace(0, np.nan)
+
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - l
+
+    prev_open = prior(o)
+    prev_close = prior(c)
+
+    # Hammer: small real body and long lower wick.
+    hammer = (
+        (lower_wick >= 2 * body) &
+        (upper_wick <= body) &
+        (body / candle_range <= 0.35)
+    )
+
+    # Shooting star: small real body and long upper wick.
+    shooting_star = (
+        (upper_wick >= 2 * body) &
+        (lower_wick <= body) &
+        (body / candle_range <= 0.35)
+    )
+
+    # Bullish engulfing.
+    bullish_engulfing = (
+        (prev_close < prev_open) &
+        (c > o) &
+        (o <= prev_close) &
+        (c >= prev_open)
+    )
+
+    # Bearish engulfing.
+    bearish_engulfing = (
+        (prev_close > prev_open) &
+        (c < o) &
+        (o >= prev_close) &
+        (c <= prev_open)
+    )
+
+    # Previous 12 completed five-minute candles.
+    # Shift prevents current-candle leakage.
+    resistance = h.groupby(session).transform(
+        lambda s: s.rolling(
+            12, min_periods=6
+        ).max().shift(1)
+    )
+
+    support = l.groupby(session).transform(
+        lambda s: s.rolling(
+            12, min_periods=6
+        ).min().shift(1)
+    )
+
+    x["support"] = support
+    x["resistance"] = resistance
+
+    # Volume relative to previous 12 candles.
+    avg_volume = x["volume"].groupby(
+        session
+    ).transform(
+        lambda s: s.rolling(
+            12, min_periods=6
+        ).mean().shift(1)
+    )
+
+    x["volume_ratio"] = (
+        x["volume"] / avg_volume.replace(0, np.nan)
+    )
+
+    bullish_breakout = (
+        (c > resistance) &
+        (prev_close <= prior(resistance)) &
+        (x["volume_ratio"] >= 1.5)
+    )
+
+    bearish_breakdown = (
+        (c < support) &
+        (prev_close >= prior(support)) &
+        (x["volume_ratio"] >= 1.5)
+    )
+
+    # Require hammer/star proximity to recent levels.
+    tolerance = 0.0015
+
+    near_support = (
+        support.notna() &
+        (l <= support * (1 + tolerance)) &
+        (h >= support * (1 - tolerance))
+    )
+
+    near_resistance = (
+        resistance.notna() &
+        (h >= resistance * (1 - tolerance)) &
+        (l <= resistance * (1 + tolerance))
+    )
+
+    x["pattern"] = ""
+    x["direction"] = ""
+
+    patterns = [
+        (
+            hammer & near_support,
+            "Hammer at support",
+            "BULLISH"
+        ),
+        (
+            shooting_star & near_resistance,
+            "Shooting star at resistance",
+            "BEARISH"
+        ),
+        (
+            bullish_engulfing,
+            "Bullish engulfing",
+            "BULLISH"
+        ),
+        (
+            bearish_engulfing,
+            "Bearish engulfing",
+            "BEARISH"
+        ),
+        (
+            bullish_breakout,
+            "Resistance breakout",
+            "BULLISH"
+        ),
+        (
+            bearish_breakdown,
+            "Support breakdown",
+            "BEARISH"
+        )
+    ]
+
+    for condition, name, direction in patterns:
+        x.loc[condition, "pattern"] = name
+        x.loc[condition, "direction"] = direction
+
+    # A 5-minute bar labeled 10:00 is known
+    # only after it completes at 10:05.
+    x["detected_at"] = x.index + pd.Timedelta(
+        minutes=5
+    )
+
+    return x
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -850,7 +1053,20 @@ with st.sidebar:
         type="primary"
     )
 
+show_patterns = st.checkbox(
+    "Show price action patterns",
+    value=True
+)
 
+show_levels = st.checkbox(
+    "Show support and resistance",
+    value=True
+)
+
+show_pattern_table = st.checkbox(
+    "Show detected pattern details",
+    value=True
+)
 # ============================================================
 # HISTORICAL VALIDATION - RUN ONLY ON BUTTON CLICK
 # ============================================================
@@ -1094,6 +1310,104 @@ def live_dashboard():
                     )
                 )
             )
+            # ============================================================
+# ADD PRICE ACTION PATTERNS TO QQQ CHART
+# ============================================================
+
+patterns = detect_price_patterns(raw)
+
+if not patterns.empty:
+    # Only show patterns from the chart's trading day.
+    patterns = patterns[
+        patterns.index.date == latest_day
+    ].copy()
+
+    # The latest five-minute candle must be complete.
+    patterns = patterns[
+        patterns["detected_at"] <= latest_ts
+    ]
+
+    # Use event time, not the start of the candle.
+    if show_patterns:
+        detected = patterns[
+            patterns["pattern"] != ""
+        ].copy()
+
+        if not chart_data.empty:
+            detected = detected[
+                detected["detected_at"] >= chart_data.index.min()
+            ]
+
+        bullish = detected[
+            detected["direction"] == "BULLISH"
+        ]
+
+        bearish = detected[
+            detected["direction"] == "BEARISH"
+        ]
+
+        fig.add_trace(
+            go.Scatter(
+                x=bullish["detected_at"],
+                y=bullish["low"] * 0.9995,
+                mode="markers",
+                name="Bullish pattern",
+                marker=dict(
+                    symbol="triangle-up",
+                    size=12,
+                    color="green"
+                ),
+                text=bullish["pattern"],
+                hovertemplate=(
+                    "%{text}<br>"
+                    "%{x}<br>"
+                    "Price: %{y:.2f}"
+                    "<extra></extra>"
+                )
+            )
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=bearish["detected_at"],
+                y=bearish["high"] * 1.0005,
+                mode="markers",
+                name="Bearish pattern",
+                marker=dict(
+                    symbol="triangle-down",
+                    size=12,
+                    color="red"
+                ),
+                text=bearish["pattern"],
+                hovertemplate=(
+                    "%{text}<br>"
+                    "%{x}<br>"
+                    "Price: %{y:.2f}"
+                    "<extra></extra>"
+                )
+            )
+        )
+
+    if show_levels and not chart_data.empty:
+        latest_pattern = patterns.iloc[-1] if len(patterns) else None
+
+        if latest_pattern is not None:
+            for column, color, label in [
+                ("support", "green", "Support"),
+                ("resistance", "red", "Resistance")
+            ]:
+                level = latest_pattern[column]
+
+                if pd.notna(level):
+                    fig.add_hline(
+                        y=float(level),
+                        line_color=color,
+                        line_dash="dash",
+                        annotation_text=(
+                            f"{label}: ${level:.2f}"
+                        ),
+                        annotation_position="top right"
+                    )
 
         fig.update_layout(
             height=520,
@@ -1106,6 +1420,41 @@ def live_dashboard():
         st.plotly_chart(
             fig,
             use_container_width=True
+        )
+        if show_pattern_table and not patterns.empty:
+    st.subheader("QQQ Price Action Patterns")
+
+    events = patterns[
+        patterns["pattern"] != ""
+    ].copy()
+
+    if events.empty:
+        st.info(
+            "No qualifying price-action patterns "
+            "detected in the available session."
+        )
+    else:
+        events = events[[
+            "detected_at",
+            "close",
+            "pattern",
+            "direction",
+            "support",
+            "resistance",
+            "volume_ratio"
+        ]].tail(20)
+
+        st.dataframe(
+            events,
+            use_container_width=True
+        )
+
+        latest_event = events.iloc[-1]
+
+        st.caption(
+            "Most recent pattern: "
+            f"{latest_event['pattern']} "
+            f"({latest_event['direction']})"
         )
 
         # ====================================================
