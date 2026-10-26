@@ -1208,10 +1208,7 @@ st.subheader("QQQ Live Chart & Forecast")
 def live_dashboard():
 
     if not API_KEY or not API_SECRET:
-        st.warning(
-            "Configure Alpaca credentials "
-            "in Streamlit Secrets."
-        )
+        st.warning("Missing Alpaca credentials.")
         return
 
     try:
@@ -1310,7 +1307,7 @@ def live_dashboard():
                     )
                 )
             )
-            # ============================================================
+# ============================================================
 # ADD PRICE ACTION PATTERNS TO QQQ CHART
 # ============================================================
 
@@ -1412,15 +1409,17 @@ if not patterns.empty:
         fig.update_layout(
             height=520,
             xaxis_rangeslider_visible=False,
-            title=f"QQQ - {chart_window}",
-            xaxis_title="Eastern Time",
-            yaxis_title="Price ($)"
         )
 
         st.plotly_chart(
             fig,
             use_container_width=True
         )
+        except requests.HTTPError as exc:
+        st.error(f"Alpaca API error: {exc}")
+
+    except Exception as exc:
+        st.error(f"Live refresh failed: {exc}")
         if show_pattern_table and not patterns.empty:
     st.subheader("QQQ Price Action Patterns")
 
