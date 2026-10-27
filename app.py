@@ -1,6 +1,7 @@
 
 import datetime as dt
 import hashlib
+import re
 import time
 from zoneinfo import ZoneInfo
 
@@ -22,7 +23,7 @@ from sklearn.metrics import accuracy_score, log_loss
 # ============================================================
 
 st.set_page_config(
-    page_title="QQQ Intraday Predictor",
+    page_title="Stock Intraday Predictor",
     layout="wide"
 )
 
@@ -154,7 +155,7 @@ def clean(raw):
 # ============================================================
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_alpaca(start, end, feed):
+def fetch_alpaca(start, end, feed, symbol):
     if not API_KEY or not API_SECRET:
         raise ValueError(
             "Alpaca credentials missing from Streamlit Secrets"
@@ -162,7 +163,7 @@ def fetch_alpaca(start, end, feed):
 
     url = (
         "https://data.alpaca.markets"
-        "/v2/stocks/QQQ/bars"
+        f"/v2/stocks/{symbol}/bars"
     )
 
     headers = {
@@ -230,7 +231,7 @@ def fetch_alpaca(start, end, feed):
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def historical_data(end_day, feed):
+def historical_data(end_day, feed, symbol):
     # Completed sessions only.
     end_date = dt.date.fromisoformat(end_day)
     start_date = end_date - dt.timedelta(days=65)
@@ -246,11 +247,11 @@ def historical_data(end_day, feed):
             dt.time.min,
             UTC
         ).isoformat(),
-        feed
+        feed, symbol
     )
 
 
-def get_live_data(feed):
+def get_live_data(feed, symbol):
     now = dt.datetime.now(UTC)
 
     # Use a short recent-data request.
@@ -268,7 +269,7 @@ def get_live_data(feed):
     return fetch_alpaca(
         start_dt.isoformat(),
         end_dt.isoformat(),
-        feed
+        feed, symbol
     )
 
 
@@ -982,11 +983,91 @@ def detect_price_patterns(raw):
 
     return x
 # ============================================================
+# PREVIOUS SESSION, OPENING RANGE, CONFIRMED PIVOT TRENDLINES
+# ============================================================
+
+def price_levels(raw, selected_day, or_minutes=15, asof=None):
+    """Levels available by asof (exclusive end of last observed 1m bar).
+
+    PDH/PDL/PDC use the previous available regular session.
+    Trendlines use pivots confirmed by two subsequent candles.
+    """
+    days = sorted(set(raw.index.date))
+    previous = [d for d in days if d < selected_day]
+    today = raw[raw.index.date == selected_day].copy()
+    if asof is not None:
+        today = today[today.index < asof]
+    result = {"PDH": np.nan, "PDL": np.nan, "PDC": np.nan,
+              "OR High": np.nan, "OR Low": np.nan,
+              "Support": np.nan, "Resistance": np.nan,
+              "Support trendline": None, "Resistance trendline": None}
+    if previous:
+        prior = raw[raw.index.date == previous[-1]]
+        result.update(PDH=float(prior.high.max()),
+                      PDL=float(prior.low.min()),
+                      PDC=float(prior.close.iloc[-1]))
+    # Opening range is not final until all required minutes exist.
+    opening = today.between_time("09:30", "15:59").head(or_minutes)
+    if len(opening) == or_minutes:
+        expected = pd.date_range(
+            pd.Timestamp(selected_day).tz_localize(NY) + pd.Timedelta(hours=9, minutes=30),
+            periods=or_minutes, freq="min")
+        if np.array_equal(opening.index.asi8, expected.asi8):
+            result["OR High"] = float(opening.high.max())
+            result["OR Low"] = float(opening.low.min())
+    if today.empty:
+        return result
+    # Rolling levels based on prior 20 candles, not current candle.
+    result["Support"] = float(today.low.shift(1).tail(20).min()) if len(today)>1 else np.nan
+    result["Resistance"] = float(today.high.shift(1).tail(20).max()) if len(today)>1 else np.nan
+    # Pivot at i becomes known at i+2. Only confirmed pivots are used.
+    n = len(today)
+    if n >= 7:
+        lows, highs = today.low.to_numpy(), today.high.to_numpy()
+        pivot_lows = [i for i in range(2, n-2)
+                      if lows[i] < min(lows[i-2:i]) and lows[i] <= min(lows[i+1:i+3])]
+        pivot_highs = [i for i in range(2, n-2)
+                       if highs[i] > max(highs[i-2:i]) and highs[i] >= max(highs[i+1:i+3])]
+        for name, idxs, values in [
+            ("Support trendline", pivot_lows, lows),
+            ("Resistance trendline", pivot_highs, highs)
+        ]:
+            if len(idxs) >= 2:
+                a, b = idxs[-2:]
+                slope = (values[b] - values[a]) / (b-a)
+                result[name] = (today.index[a], float(values[a]),
+                                today.index[-1], float(values[a]+slope*(n-1-a)))
+    return result
+
+
+def draw_levels(fig, levels, chart_index):
+    """Overlay horizontal price levels and last confirmed trendlines."""
+    palette = {"PDH": "#2ca02c", "PDL": "#d62728", "PDC": "#7f7f7f",
+               "OR High": "#17becf", "OR Low": "#ff7f0e",
+               "Support": "#1f77b4", "Resistance": "#9467bd"}
+    for name, color in palette.items():
+        value = levels.get(name)
+        if value is not None and pd.notna(value):
+            fig.add_hline(y=float(value), line_color=color,
+                          line_dash="dot" if name.startswith("OR") else "dash",
+                          line_width=1, annotation_text=f"{name} {value:.2f}",
+                          annotation_position="top right")
+    for name, color in [("Support trendline", "#008000"),
+                        ("Resistance trendline", "#cc0000")]:
+        line = levels.get(name)
+        if line is not None:
+            x0, y0, x1, y1 = line
+            fig.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1],
+                                     mode="lines", name=name,
+                                     line=dict(color=color, width=2, dash="dash")))
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 
 st.title(
-    "QQQ | Intraday Prediction & Walk-forward Validation"
+    "Stock | Intraday Prediction & Walk-forward Validation"
 )
 
 st.caption(
@@ -995,7 +1076,13 @@ st.caption(
 )
 
 with st.sidebar:
-    st.header("QQQ Live Chart")
+    st.header("Stock Live Chart")
+
+    symbol = st.text_input("US stock/ETF ticker", value="QQQ", max_chars=10).strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", symbol):
+        st.error("Enter a valid US ticker, e.g. QQQ, AAPL, TSLA.")
+        st.stop()
+    opening_range_minutes = st.selectbox("Opening range (minutes)", [5, 15, 30], index=1)
 
     chart_window = st.selectbox(
         "Chart timeframe",
@@ -1034,7 +1121,7 @@ with st.sidebar:
     st.header("Historical Validation")
 
     uploaded = st.file_uploader(
-        "Optional QQQ 1-minute CSV",
+        f"Optional {symbol} 1-minute CSV",
         type=["csv"]
     )
 
@@ -1090,7 +1177,7 @@ if run:
                 (
                     now - dt.timedelta(minutes=2)
                 ).isoformat(),
-                feed
+                feed, symbol
             )
 
         if raw.empty:
@@ -1099,6 +1186,7 @@ if run:
             )
 
         st.session_state["backtest_raw"] = raw
+        st.session_state["backtest_symbol"] = symbol
 
         with st.spinner(
             "Computing historical predictions..."
@@ -1120,11 +1208,11 @@ if run:
         )
 
 
-if "backtest_results" in st.session_state:
+if "backtest_results" in st.session_state and st.session_state.get("backtest_symbol") == symbol:
     results = st.session_state["backtest_results"]
     raw = st.session_state["backtest_raw"]
 
-    st.subheader("Historical Backtest Results")
+    st.subheader(f"{symbol} Historical Backtest Results")
 
     summary = []
 
@@ -1192,7 +1280,7 @@ if "backtest_results" in st.session_state:
     st.download_button(
         "Download historical predictions",
         data=csv,
-        file_name="QQQ_predictions.csv",
+        file_name=f"{symbol}_predictions.csv",
         mime="text/csv"
     )
 
@@ -1202,9 +1290,9 @@ if "backtest_results" in st.session_state:
 # ============================================================
 
 st.divider()
-with st.expander("Historical QQQ chart replay + price-action patterns", expanded=True):
+with st.expander("Historical stock chart replay + price-action patterns", expanded=True):
     st.caption(
-        "Upload your existing QQQ_1min_60d.csv in the sidebar, "
+        "Upload a 1-minute CSV for the selected ticker, "
         "or click Run walk-forward test to load Alpaca data. "
         "This replay does not place trades."
     )
@@ -1215,11 +1303,11 @@ with st.expander("Historical QQQ chart replay + price-action patterns", expanded
             replay_raw = clean(pd.read_csv(uploaded))
         except Exception as exc:
             st.error(f"CSV could not be read: {exc}")
-    elif "backtest_raw" in st.session_state:
+    elif "backtest_raw" in st.session_state and st.session_state.get("backtest_symbol") == symbol:
         replay_raw = st.session_state["backtest_raw"]
 
     if replay_raw is None or replay_raw.empty:
-        st.info("Upload the 60-day QQQ CSV in the sidebar to view historical charts.")
+        st.info("Upload a matching stock CSV in the sidebar to view historical charts.")
     else:
         replay_days = sorted(set(replay_raw.index.date))
         replay_day = st.selectbox(
@@ -1267,7 +1355,7 @@ with st.expander("Historical QQQ chart replay + price-action patterns", expanded
                 high=replay_day_data["high"],
                 low=replay_day_data["low"],
                 close=replay_day_data["close"],
-                name="QQQ"
+                name=symbol
             ))
             for col, color in [
                 ("ema9", "orange"),
@@ -1281,6 +1369,11 @@ with st.expander("Historical QQQ chart replay + price-action patterns", expanded
                     line=dict(color=color, width=1.5)
                 ))
 
+            replay_levels = price_levels(replay_raw, replay_day, opening_range_minutes,
+                                         asof=chart_end)
+            if show_replay_levels:
+                draw_levels(chart, replay_levels, replay_day_data.index)
+
             if not replay_patterns.empty:
                 # Only show events whose 5-minute candle had completed.
                 visible = replay_patterns[
@@ -1288,7 +1381,7 @@ with st.expander("Historical QQQ chart replay + price-action patterns", expanded
                     (replay_patterns["detected_at"] <= chart_end)
                 ].copy()
                 if show_replay_patterns:
-                    for direction, symbol, color, offset in [
+                    for direction, marker_symbol, color, offset in [
                         ("BULLISH", "triangle-up", "green", 0.9995),
                         ("BEARISH", "triangle-down", "red", 1.0005)
                     ]:
@@ -1302,28 +1395,16 @@ with st.expander("Historical QQQ chart replay + price-action patterns", expanded
                             y=matched[level_col] * offset,
                             text=matched["pattern"],
                             mode="markers", name=f"{direction} pattern",
-                            marker=dict(symbol=symbol, color=color, size=12),
+                            marker=dict(symbol=marker_symbol, color=color, size=12),
                             hovertemplate="%{text}<br>%{x}<extra></extra>"
                         ))
-                if show_replay_levels and not visible.empty:
-                    last = visible.iloc[-1]
-                    for col, color in [
-                        ("support", "green"),
-                        ("resistance", "red")
-                    ]:
-                        if pd.notna(last[col]):
-                            chart.add_hline(
-                                y=float(last[col]), line_color=color,
-                                line_dash="dash",
-                                annotation_text=f"{col.title()}: ${last[col]:.2f}"
-                            )
 
             chart.update_layout(
-                title=f"QQQ historical replay - {replay_day}",
+                title=f"{symbol} historical replay - {replay_day}",
                 height=550,
                 xaxis_rangeslider_visible=False,
                 xaxis_title="Eastern Time",
-                yaxis_title="QQQ price ($)"
+                yaxis_title=f"{symbol} price ($)"
             )
             st.plotly_chart(chart, use_container_width=True)
             if not replay_patterns.empty:
@@ -1344,7 +1425,7 @@ with st.expander("Historical QQQ chart replay + price-action patterns", expanded
 # ============================================================
 
 st.divider()
-st.subheader("QQQ Live Chart & Forecast")
+st.subheader(f"{symbol} Live Chart & Forecast")
 
 @st.fragment(run_every="30s")
 def live_dashboard():
@@ -1364,24 +1445,24 @@ def live_dashboard():
 
             history = historical_data(
                 today.isoformat(),
-                feed
+                feed, symbol
             )
 
-            recent = get_live_data(feed)
+            recent = get_live_data(feed, symbol)
 
             raw = combine_data(
                 history, recent
             )
 
         if raw.empty:
-            st.warning("No QQQ market data available")
+            st.warning(f"No {symbol} market data available")
             return
 
         latest_ts = raw.index[-1]
         latest_close = raw["close"].iloc[-1]
 
         st.metric(
-            "QQQ Latest Completed Close",
+            f"{symbol} Latest Completed Close",
             f"${latest_close:.2f}"
         )
 
@@ -1428,7 +1509,7 @@ def live_dashboard():
                 high=chart_data["high"],
                 low=chart_data["low"],
                 close=chart_data["close"],
-                name="QQQ"
+                name=symbol
             )
         )
 
@@ -1527,31 +1608,20 @@ def live_dashboard():
                     )
                 )
 
-            if show_levels and not chart_data.empty:
-                latest_pattern = patterns.iloc[-1] if len(patterns) else None
 
-                if latest_pattern is not None:
-                    for column, color, label in [
-                        ("support", "green", "Support"),
-                        ("resistance", "red", "Resistance")
-                    ]:
-                        level = latest_pattern[column]
-
-                        if pd.notna(level):
-                            fig.add_hline(
-                                y=float(level),
-                                line_color=color,
-                                line_dash="dash",
-                                annotation_text=(
-                                    f"{label}: ${level:.2f}"
-                                ),
-                                annotation_position="top right"
-                            )
+        current_levels = price_levels(raw, latest_day, opening_range_minutes,
+                                      asof=latest_ts + pd.Timedelta(minutes=1))
+        if show_levels:
+            draw_levels(fig, current_levels, chart_data.index)
+        level_cols = st.columns(5)
+        for col, key in zip(level_cols, ["PDH", "PDL", "PDC", "OR High", "OR Low"]):
+            value = current_levels[key]
+            col.metric(key, f"${value:.2f}" if pd.notna(value) else "Pending")
 
         fig.update_layout(height=520, xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
         if show_pattern_table and not patterns.empty:
-            st.subheader("QQQ Price Action Patterns")
+            st.subheader(f"{symbol} Price Action Patterns")
             events = patterns[patterns["pattern"] != ""].copy()
             if events.empty:
                 st.info("No qualifying price-action patterns detected in the available session.")
@@ -1587,7 +1657,7 @@ def live_dashboard():
         # Create a stable model cache key.
         # Changes when completed training data changes.
         training_signature = (
-            f"{feed}|{training_days[-1]}|"
+            f"{symbol}|{feed}|{training_days[-1]}|"
             f"{len(training_df)}|"
             f"{training_df.close.iloc[-1]:.6f}|"
             f"{training_df.volume.sum():.0f}"
@@ -1618,7 +1688,7 @@ def live_dashboard():
             )
             return
 
-        st.subheader("QQQ Intraday Predictions")
+        st.subheader(f"{symbol} Intraday Predictions")
 
         st.dataframe(
             forecast_df.style.format({
@@ -1645,7 +1715,7 @@ def live_dashboard():
 
         latest = features.iloc[-1]
 
-        st.subheader("Current Indicator Alignment")
+        st.subheader(f"{symbol} Current Indicator Alignment")
 
         indicators = {
             "Price": latest["close"],
