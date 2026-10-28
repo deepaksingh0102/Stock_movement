@@ -25,7 +25,10 @@ def secret(*names, default=''):
 def clean(raw, naive_tz='America/New_York'):
     df = raw.copy()
     df.columns = [str(c).lower().strip() for c in df.columns]
-    if 'timestamp' in df.columns:
+    if 'timestamp_utc' in df.columns:
+        times = pd.to_datetime(df['timestamp_utc'], errors='coerce', utc=True)
+        df.index = pd.DatetimeIndex(times).tz_convert(NY)
+    elif 'timestamp' in df.columns:
         times = pd.to_datetime(df['timestamp'], errors='coerce')
         if times.dt.tz is None:
             times = times.dt.tz_localize(naive_tz, ambiguous='NaT', nonexistent='NaT')
@@ -159,8 +162,20 @@ def make_boxes(raw, lookback=12, max_width_pct=0.9, vol_multiplier=1.2,
         if require_volume:
             long_ok &= d.vol_ratio >= vol_multiplier
             short_ok &= d.vol_ratio >= vol_multiplier
+        # Explicit audit fields: these are computed from the SAME previous box
+        # used for both the live chart and the backtest.
+        d['price_break_up'] = eligible & (d.close > d.box_high)
+        d['price_break_down'] = eligible & (d.close < d.box_low)
+        d['trend_long_ok'] = (d.ema9 > d.ema20) & (d.close > d.vwap)
+        d['trend_short_ok'] = (d.ema9 < d.ema20) & (d.close < d.vwap)
+        d['volume_ok'] = d.vol_ratio >= vol_multiplier
         d['signal'] = np.select([long_ok, short_ok], [1, -1], default=0)
         d['signal_time'] = d.index + pd.Timedelta(minutes=5)
+        d['status'] = np.select(
+            [d.signal == 1, d.signal == -1,
+             d.price_break_up, d.price_break_down],
+            ['CONFIRMED UP', 'CONFIRMED DOWN', 'PRICE ABOVE BOX', 'PRICE BELOW BOX'],
+            default='INSIDE BOX / INELIGIBLE')
         blocks.append(d)
     return pd.concat(blocks).sort_index()
 
@@ -172,7 +187,7 @@ def backtest(boxes, hold_bars=6, stop_atr=1.2, reward_risk=1.5, cost_bps=2.0):
     """
     trades = []
     for day, d in boxes.groupby(boxes.index.date):
-        d = d.reset_index().rename(columns={'index': 'timestamp'})
+        d = d.reset_index().rename(columns={d.index.name or 'index': 'timestamp'})
         i = 0
         while i < len(d) - 1:
             s = int(d.at[i, 'signal'])
@@ -227,6 +242,24 @@ def summarize(trades):
             'Profit factor': wins / losses if losses else np.nan}
 
 
+def breakout_audit(boxes, day=None):
+    """Single-source audit; timestamps are 5-minute candle CLOSE times in ET."""
+    b = boxes if day is None else boxes[boxes.index.date == day]
+    if b.empty:
+        return pd.DataFrame()
+    a = b.copy()
+    a['candle_start_et'] = a.index
+    a['candle_close_et'] = a['signal_time']
+    a['side'] = np.select([a.price_break_up, a.price_break_down],
+                          ['UP', 'DOWN'], default='INSIDE')
+    a['trend_ok'] = np.where(a.price_break_up, a.trend_long_ok,
+                              np.where(a.price_break_down, a.trend_short_ok, False))
+    cols = ['candle_start_et', 'candle_close_et', 'open', 'close',
+            'box_high', 'box_low', 'box_width_pct', 'side',
+            'trend_ok', 'vol_ratio', 'volume_ok', 'signal', 'status']
+    return a.loc[a.side != 'INSIDE', cols].reset_index(drop=True)
+
+
 def chart_for_day(raw, boxes, day, opening_minutes, visible_bars):
     d = raw[raw.index.date == day].copy()
     b = boxes[boxes.index.date == day].copy()
@@ -235,17 +268,28 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars):
     fig = go.Figure()
     fig.add_trace(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low,
                                  close=d.close, name='Price'))
-    if not b.empty:
-        shown = b[(b.index + pd.Timedelta(minutes=5)) >= d.index.min()]
-        for name, color in [('box_high', '#e67e22'), ('box_low', '#16a085'),
-                            ('ema9', '#eab308'), ('ema20', '#2563eb'), ('vwap', '#8b5cf6')]:
-            fig.add_trace(go.Scatter(x=shown.index, y=shown[name], mode='lines',
+    if not b.empty and not d.empty:
+        # All box values and signals become known at the five-minute candle CLOSE.
+        # Plot the prior-box boundaries at that timestamp, not at candle start.
+        shown = b[(b.signal_time >= d.index.min()) &
+                  (b.signal_time <= d.index[-1] + pd.Timedelta(minutes=1))]
+        for name, color in [('box_high', '#e67e22'), ('box_low', '#16a085')]:
+            fig.add_trace(go.Scatter(x=shown.signal_time, y=shown[name],
+                                     mode='lines+markers', name=name.upper() + ' (prior)',
+                                     line=dict(color=color, width=2, shape='hv'),
+                                     marker=dict(size=4),
+                                     customdata=shown.close,
+                                     hovertemplate=(
+                                         '%{x}<br>Prior ' + name + ': %{y:.3f}' +
+                                         '<br>5m close: %{customdata:.3f}<extra></extra>')))
+        for name, color in [('ema9', '#eab308'), ('ema20', '#2563eb'),
+                            ('vwap', '#8b5cf6')]:
+            fig.add_trace(go.Scatter(x=shown.signal_time, y=shown[name], mode='lines',
                                      name=name.upper(), line=dict(color=color, width=1.5)))
-        for s, color, marker, label in [(1, 'green', 'triangle-up', 'Bullish box breakout'),
-                                        (-1, 'red', 'triangle-down', 'Bearish box breakdown')]:
-            ev = shown[shown.signal == s]
-            fig.add_trace(go.Scatter(x=ev.signal_time,
-                                     y=ev.close * (0.9997 if s == 1 else 1.0003),
+        for side, color, marker, label in [(1, 'green', 'triangle-up', 'Confirmed UP'),
+                                           (-1, 'red', 'triangle-down', 'Confirmed DOWN')]:
+            ev = shown[shown.signal == side]
+            fig.add_trace(go.Scatter(x=ev.signal_time, y=ev.close,
                                      mode='markers', name=label,
                                      marker=dict(color=color, size=12, symbol=marker)))
     levels = levels_for_day(raw, day, opening_minutes)
@@ -255,18 +299,16 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars):
         if np.isfinite(val):
             fig.add_hline(y=val, line_dash='dot', line_color=palette[name],
                           annotation_text=f'{name} {val:.2f}', annotation_position='top right')
-    # Two confirmed swing pivots on 5-minute bars, two future bars for confirmation.
+    # Trendlines are visual aids only. They do not enter breakout conditions.
     if len(b) >= 9:
         for field, color, is_high in [('high', '#ef4444', True), ('low', '#22c55e', False)]:
             arr = b[field].to_numpy()
             pivots = []
             for j in range(2, len(arr)-2):
-                left = arr[j-2:j]
-                right = arr[j+1:j+3]
+                left, right = arr[j-2:j], arr[j+1:j+3]
                 if ((arr[j] > max(left) and arr[j] >= max(right)) if is_high else
                     (arr[j] < min(left) and arr[j] <= min(right))):
                     pivots.append(j)
-            # Only the latest pair, drawn after both pivots have confirmed.
             if len(pivots) >= 2:
                 a, z = pivots[-2:]
                 slope = (arr[z] - arr[a]) / (z - a)
@@ -274,7 +316,8 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars):
                     y=[arr[a], arr[a] + slope * (len(b)-1-a)], mode='lines',
                     name='Resistance trendline' if is_high else 'Support trendline',
                     line=dict(color=color, width=2, dash='dash')))
-    fig.update_layout(height=600, title=f'{day} | Darvas-style box levels and breakout signals',
+    fig.update_layout(height=600,
+                      title=f'{day} | Previous completed box (5m candle close, ET)',
                       xaxis_title='Eastern Time', yaxis_title='Price ($)',
                       xaxis_rangeslider_visible=False)
     return fig, levels
@@ -337,7 +380,7 @@ def live_dashboard():
         if raw.empty:
             st.warning('No recent market data')
             return
-        boxes = make_boxes(raw, lookback, max_width, vol_mult)
+        boxes = make_boxes(raw, lookback, max_width, vol_mult, True, True)
         latest_day = raw.index[-1].date()
         fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window])
         st.subheader(f'{symbol} | Live chart (refresh every 30 seconds)')
@@ -356,9 +399,13 @@ def live_dashboard():
             st.write(f'**{signal}** | Box high: {latest.box_high:.2f} | Box low: {latest.box_low:.2f} | '
                      f'Volume ratio: {latest.vol_ratio:.2f} | EMA9: {latest.ema9:.2f} | EMA20: {latest.ema20:.2f}')
             st.caption('Signal is descriptive, not a probability. Any entry must wait for the next candle and use a defined stop.')
-            events = day_boxes[day_boxes.signal != 0]
-            if not events.empty:
-                st.dataframe(events[['signal_time', 'signal', 'box_high', 'box_low', 'vol_ratio']].tail(20), use_container_width=True)
+            audit = breakout_audit(boxes, latest_day)
+            st.subheader('Breakout audit — previous box vs 5m close')
+            st.caption('All times are Eastern. Price crossing is shown even when trend/volume filters reject the trade.')
+            if not audit.empty:
+                st.dataframe(audit.tail(30), hide_index=True, use_container_width=True)
+            else:
+                st.info('No price crossings of the previous completed box yet.')
     except Exception as exc:
         st.error(f'Live data/chart error: {exc}')
 
@@ -380,8 +427,11 @@ if run_test:
         else:
             raise ValueError('Upload a CSV or configure Alpaca credentials')
         if len(set(test_raw.index.date)) < 10:
-            raise ValueError('At least 10 sessions recommended for backtesting')
+            st.warning('Fewer than 10 sessions: diagnostic only, not reliable strategy validation.')
         st.session_state['test_raw'] = test_raw
+        st.session_state['test_symbol'] = symbol
+        st.session_state['test_settings'] = (lookback, max_width, vol_mult, hold_minutes,
+                                             stop_atr, reward_risk, cost_bps, feed)
         # Compare the unfiltered box breakout with the trend+volume filtered version.
         comparisons = []
         for label, trend, volume in [
@@ -400,6 +450,11 @@ if run_test:
         st.error(f'Backtest failed: {exc}')
 
 if 'test_comparison' in st.session_state:
+    current_settings = (lookback, max_width, vol_mult, hold_minutes,
+                        stop_atr, reward_risk, cost_bps, feed)
+    if (current_settings != st.session_state.get('test_settings') or
+            symbol != st.session_state.get('test_symbol')):
+        st.warning('Backtest results use earlier ticker/settings. Click Run historical backtest to update.')
     st.subheader('Strategy comparison')
     table = st.session_state['test_comparison']
     st.dataframe(table.style.format({'Win rate':'{:.1%}', 'Avg net bps':'{:.2f}',
@@ -417,4 +472,13 @@ if 'test_comparison' in st.session_state:
     fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
                                 chosen, opening, windows[window])
     st.plotly_chart(fig, use_container_width=True)
-    st.caption('Chart shows completed 5-minute box levels and signals. Trendlines are visual aids, not entry rules.')
+    st.caption('Chart and backtest use the same make_boxes() output and prior-box values. ET labels mark candle CLOSE time. Trendlines are visual aids only.')
+    st.subheader('Historical breakout audit')
+    audit = breakout_audit(st.session_state['test_boxes'], chosen)
+    if not audit.empty:
+        st.dataframe(audit, hide_index=True, use_container_width=True)
+        st.download_button('Download breakout audit CSV', audit.to_csv(index=False),
+                           file_name=f'{st.session_state.get("test_symbol", symbol)}_{chosen}_breakout_audit.csv',
+                           mime='text/csv')
+    else:
+        st.info('No previous-box price breakouts detected on this day.')
