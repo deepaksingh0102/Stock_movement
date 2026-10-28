@@ -1,8 +1,6 @@
-
+"""Stock Movement V5: rule-based Darvas-style box breakout research dashboard."""
 import datetime as dt
-import hashlib
 import re
-import time
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -11,1745 +9,412 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-from sklearn.pipeline import make_pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, log_loss
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-st.set_page_config(
-    page_title="Stock Intraday Predictor",
-    layout="wide"
-)
-
-NY = ZoneInfo("America/New_York")
+NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-
-HORIZONS = [5, 15, 30, 60]
-
-THRESHOLDS = {
-    5: 5,
-    15: 8,
-    30: 12,
-    60: 18
-}
-
-FEATURES = [
-    "ret1", "ret5", "ret15",
-    "ema_spread", "ema50_gap",
-    "vwap_gap", "rsi", "macd_hist",
-    "adx", "atr_pct", "rvol",
-    "range_pct", "body_pct",
-    "wick_up", "wick_down",
-    "break20", "sin_time", "cos_time"
-]
-
-CHART_WINDOWS = {
-    "5 minutes": 5,
-    "15 minutes": 15,
-    "1 hour": 60,
-    "2 hours": 120,
-    "3 hours": 180,
-    "4 hours": 240,
-    "Since market open": None
-}
-
-LABELS = np.array(["DOWN", "SIDEWAYS", "UP"])
+st.set_page_config(page_title='Stock Movement | Box Theory V5', layout='wide')
 
 
-# ============================================================
-# STREAMLIT SECRETS
-# ============================================================
-
-def get_secret(*names):
+def secret(*names, default=''):
     for name in names:
-        value = st.secrets.get(name, "")
-        if value and str(value).strip():
-            return str(value).strip()
-    return ""
+        v = st.secrets.get(name, '')
+        if v and str(v).strip():
+            return str(v).strip()
+    return default
 
 
-API_KEY = get_secret(
-    "ALPACA_API_KEY",
-    "APCA_API_KEY_ID",
-    "ALPACA_KEY"
-)
-
-API_SECRET = get_secret(
-    "ALPACA_SECRET_KEY",
-    "APCA_API_SECRET_KEY",
-    "ALPACA_SECRET"
-)
-
-DEFAULT_FEED = get_secret("ALPACA_FEED") or "iex"
-
-
-# ============================================================
-# CLEAN AND NORMALIZE DATA
-# ============================================================
-
-def clean(raw):
-    x = raw.copy()
-
-    x.columns = [
-        str(c).strip().lower()
-        for c in x.columns
-    ]
-
-    if "timestamp" in x.columns:
-        parsed = pd.to_datetime(
-            x["timestamp"],
-            errors="coerce",
-            utc=True
-        )
-        x["timestamp"] = parsed
-        x = x.set_index("timestamp")
-
-    if not isinstance(x.index, pd.DatetimeIndex):
-        raise ValueError(
-            "Data requires a timestamp column or DatetimeIndex"
-        )
-
-    if x.index.tz is None:
-        # Assume naive timestamps are UTC.
-        x.index = x.index.tz_localize("UTC")
-
-    x.index = x.index.tz_convert(NY)
-
-    required = [
-        "open", "high", "low", "close", "volume"
-    ]
-
-    missing = [
-        col for col in required
-        if col not in x.columns
-    ]
-
-    if missing:
-        raise ValueError(
-            f"Missing columns: {missing}"
-        )
-
-    x = x[required].apply(
-        pd.to_numeric,
-        errors="coerce"
-    ).dropna()
-
-    x = x[~x.index.isna()]
-    x = x[~x.index.duplicated(keep="last")]
-    x = x.sort_index()
-
-    x = x.between_time("09:30", "15:59")
-    x = x[x.index.dayofweek < 5]
-
-    return x
+def clean(raw, naive_tz='America/New_York'):
+    df = raw.copy()
+    df.columns = [str(c).lower().strip() for c in df.columns]
+    if 'timestamp' in df.columns:
+        times = pd.to_datetime(df['timestamp'], errors='coerce')
+        if times.dt.tz is None:
+            times = times.dt.tz_localize(naive_tz, ambiguous='NaT', nonexistent='NaT')
+        df.index = pd.DatetimeIndex(times).tz_convert(NY)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        df.index = (df.index.tz_localize(naive_tz) if df.index.tz is None else df.index).tz_convert(NY)
+    else:
+        raise ValueError('CSV needs a timestamp column')
+    required = ['open', 'high', 'low', 'close', 'volume']
+    if any(c not in df for c in required):
+        raise ValueError('CSV needs timestamp, open, high, low, close, volume columns')
+    df = df[required].apply(pd.to_numeric, errors='coerce').dropna()
+    df = df[~df.index.isna()]
+    df = df[~df.index.duplicated(keep='last')].sort_index()
+    df = df.between_time('09:30', '15:59')
+    return df[df.index.dayofweek < 5]
 
 
-# ============================================================
-# ALPACA API
-# ============================================================
-
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_alpaca(start, end, feed, symbol):
-    if not API_KEY or not API_SECRET:
-        raise ValueError(
-            "Alpaca credentials missing from Streamlit Secrets"
-        )
-
-    url = (
-        "https://data.alpaca.markets"
-        f"/v2/stocks/{symbol}/bars"
-    )
-
-    headers = {
-        "APCA-API-KEY-ID": API_KEY,
-        "APCA-API-SECRET-KEY": API_SECRET
-    }
-
-    params = {
-        "start": start,
-        "end": end,
-        "timeframe": "1Min",
-        "feed": feed,
-        "adjustment": "split",
-        "limit": 10000,
-        "sort": "asc"
-    }
-
+@st.cache_data(ttl=60, show_spinner=False)
+def alpaca_bars(symbol, start, end, feed, key, secret_key):
+    url = f'https://data.alpaca.markets/v2/stocks/{symbol}/bars'
+    params = {'timeframe': '1Min', 'start': start, 'end': end,
+              'limit': 10000, 'feed': feed, 'adjustment': 'split', 'sort': 'asc'}
+    headers = {'APCA-API-KEY-ID': key, 'APCA-API-SECRET-KEY': secret_key}
     rows = []
-
     with requests.Session() as session:
-        for _ in range(200):
-            response = session.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=45
-            )
-
+        for _ in range(100):
+            response = session.get(url, params=params, headers=headers, timeout=40)
             response.raise_for_status()
-
-            payload = response.json()
-
-            rows.extend(
-                payload.get("bars", [])
-            )
-
-            token = payload.get("next_page_token")
-
+            body = response.json()
+            rows.extend(body.get('bars', []))
+            token = body.get('next_page_token')
             if not token:
                 break
-
-            params["page_token"] = token
+            params['page_token'] = token
         else:
-            raise RuntimeError(
-                "Alpaca pagination limit reached"
-            )
-
+            raise RuntimeError('Alpaca pagination exceeded 100 pages')
     if not rows:
-        raise ValueError(
-            "Alpaca returned no QQQ bars"
-        )
-
-    df = pd.DataFrame(rows).rename(
-        columns={
-            "t": "timestamp",
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume"
-        }
-    )
-
-    return clean(df)
+        raise ValueError('No bars returned: check ticker, feed, market hours, and access')
+    return clean(pd.DataFrame(rows).rename(columns={
+        't': 'timestamp', 'o': 'open', 'h': 'high', 'l': 'low',
+        'c': 'close', 'v': 'volume'}))
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def historical_data(end_day, feed, symbol):
-    # Completed sessions only.
-    end_date = dt.date.fromisoformat(end_day)
-    start_date = end_date - dt.timedelta(days=65)
-
-    return fetch_alpaca(
-        dt.datetime.combine(
-            start_date,
-            dt.time.min,
-            UTC
-        ).isoformat(),
-        dt.datetime.combine(
-            end_date,
-            dt.time.min,
-            UTC
-        ).isoformat(),
-        feed, symbol
-    )
-
-
-def get_live_data(feed, symbol):
-    now = dt.datetime.now(UTC)
-
-    # Use a short recent-data request.
-    end_dt = now - dt.timedelta(minutes=2)
-    start_dt = end_dt - dt.timedelta(days=2)
-
-    # Round request boundaries to 30-second intervals
-    # so Streamlit's data cache can reuse requests.
-    rounded = int(end_dt.timestamp() // 30) * 30
-    end_dt = dt.datetime.fromtimestamp(
-        rounded, tz=UTC
-    )
-    start_dt = end_dt - dt.timedelta(days=2)
-
-    return fetch_alpaca(
-        start_dt.isoformat(),
-        end_dt.isoformat(),
-        feed, symbol
-    )
-
-
-def combine_data(history, recent):
-    x = pd.concat([history, recent])
-    x = x[~x.index.duplicated(keep="last")]
-    return x.sort_index()
-
-
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
-
-def rma(series, n):
-    return series.ewm(
-        alpha=1 / n,
-        adjust=False,
-        min_periods=n
-    ).mean()
-
-
-def make_features(df):
-    x = df.copy()
-
-    c = x["close"]
-    h = x["high"]
-    l = x["low"]
-    o = x["open"]
-    v = x["volume"]
-
-    day = pd.Series(x.index.date, index=x.index)
-
-    def day_shift(series, n):
-        return series.groupby(day).shift(n)
-
-    x["ret1"] = (
-        c / day_shift(c, 1) - 1
-    ) * 10000
-
-    x["ret5"] = (
-        c / day_shift(c, 5) - 1
-    ) * 10000
-
-    x["ret15"] = (
-        c / day_shift(c, 15) - 1
-    ) * 10000
-
-    e9 = c.ewm(span=9, adjust=False).mean()
-    e20 = c.ewm(span=20, adjust=False).mean()
-    e50 = c.ewm(span=50, adjust=False).mean()
-
-    x["ema9"] = e9
-    x["ema20"] = e20
-
-    x["ema_spread"] = (
-        e9 / e20 - 1
-    ) * 10000
-
-    x["ema50_gap"] = (
-        c / e50 - 1
-    ) * 10000
-
-    typical = (h + l + c) / 3
-
-    cumulative_pv = (
-        typical * v
-    ).groupby(day).cumsum()
-
-    cumulative_volume = (
-        v.groupby(day).cumsum()
-    ).replace(0, np.nan)
-
-    x["vwap"] = (
-        cumulative_pv / cumulative_volume
-    )
-
-    x["vwap_gap"] = (
-        c / x["vwap"] - 1
-    ) * 10000
-
-    delta = c.diff()
-
-    gain = rma(delta.clip(lower=0), 14)
-    loss = rma((-delta).clip(lower=0), 14)
-
-    x["rsi"] = (
-        100 - 100 / (1 + gain / loss.replace(0, np.nan))
-    )
-
-    x.loc[
-        (loss == 0) & (gain > 0),
-        "rsi"
-    ] = 100
-
-    x.loc[
-        (loss == 0) & (gain == 0),
-        "rsi"
-    ] = 50
-
-    macd = (
-        c.ewm(span=12, adjust=False).mean()
-        - c.ewm(span=26, adjust=False).mean()
-    )
-
-    signal = macd.ewm(
-        span=9, adjust=False
-    ).mean()
-
-    x["macd_hist"] = (
-        (macd - signal) / c * 10000
-    )
-
-    previous = c.shift()
-
-    tr = pd.concat([
-        h - l,
-        (h - previous).abs(),
-        (l - previous).abs()
-    ], axis=1).max(axis=1)
-
-    atr = rma(tr, 14)
-
-    x["atr_pct"] = (
-        atr / c * 10000
-    )
-
-    up = h.diff()
-    down = -l.diff()
-
-    pdm = up.where(
-        (up > down) & (up > 0), 0
-    )
-
-    mdm = down.where(
-        (down > up) & (down > 0), 0
-    )
-
-    pdi = (
-        100 * rma(pdm, 14)
-        / atr.replace(0, np.nan)
-    )
-
-    mdi = (
-        100 * rma(mdm, 14)
-        / atr.replace(0, np.nan)
-    )
-
-    dx = (
-        100 * (pdi - mdi).abs()
-        / (pdi + mdi).replace(0, np.nan)
-    )
-
-    x["adx"] = rma(dx, 14)
-
-    minute = (
-        x.index.hour * 60
-        + x.index.minute
-    )
-
-    volume_matrix = x.assign(
-        session_date=x.index.date,
-        minute_of_day=minute
-    ).pivot(
-        index="session_date",
-        columns="minute_of_day",
-        values="volume"
-    )
-
-    baseline = (
-        volume_matrix.shift(1)
-        .rolling(10, min_periods=3)
-        .mean()
-    )
-
-    baseline_series = baseline.stack().rename(
-        "baseline_volume"
-    )
-
-    lookup = pd.MultiIndex.from_arrays(
-        [x.index.date, minute],
-        names=["session_date", "minute_of_day"]
-    )
-
-    expected_volume = baseline_series.reindex(
-        lookup
-    ).to_numpy()
-
-    x["rvol"] = (
-        v.to_numpy()
-        / np.where(expected_volume > 0,
-                   expected_volume, np.nan)
-    )
-
-    x["rvol"] = x["rvol"].clip(0, 20)
-
-    x["range_pct"] = (
-        (h - l) / c * 10000
-    )
-
-    x["body_pct"] = (
-        (c - o) / c * 10000
-    )
-
-    x["wick_up"] = (
-        (h - np.maximum(c, o))
-        / c * 10000
-    )
-
-    x["wick_down"] = (
-        (np.minimum(c, o) - l)
-        / c * 10000
-    )
-
-    high20 = (
-        h.groupby(day)
-        .transform(lambda s: s.rolling(20).max())
-    )
-
-    low20 = (
-        l.groupby(day)
-        .transform(lambda s: s.rolling(20).min())
-    )
-
-    high20 = day_shift(high20, 1)
-    low20 = day_shift(low20, 1)
-
-    x["break20"] = np.where(
-        c > high20,
-        1,
-        np.where(c < low20, -1, 0)
-    )
-
-    minute_in_day = minute - 570
-
-    x["sin_time"] = np.sin(
-        2 * np.pi * minute_in_day / 390
-    )
-
-    x["cos_time"] = np.cos(
-        2 * np.pi * minute_in_day / 390
-    )
-
-    x["session"] = x.index.date
-
-    for horizon in HORIZONS:
-        future = c.groupby(day).shift(-horizon)
-
-        x[f"future_{horizon}"] = (
-            future / c - 1
-        ) * 10000
-
-    return x
-
-
-# ============================================================
-# MACHINE LEARNING
-# ============================================================
-
-def build_model():
-    return make_pipeline(
-        SimpleImputer(strategy="median"),
-        StandardScaler(),
-        LogisticRegression(
-            max_iter=350
-        )
-    )
-
-
-def prepare_training(x, horizon):
-    target = f"future_{horizon}"
-
-    train = x.dropna(
-        subset=[target]
-    ).copy()
-
-    train = train[
-        train[FEATURES].notna().sum(axis=1) >= 12
-    ]
-
-    threshold = THRESHOLDS[horizon]
-
-    y = np.where(
-        train[target] > threshold,
-        2,
-        np.where(train[target] < -threshold, 0, 1)
-    )
-
-    return train, y
-
-
-@st.cache_resource(
-    show_spinner="Training QQQ models..."
-)
-def cached_models(training_key, _training_df):
-    models = {}
-
-    for horizon in HORIZONS:
-        train, y = prepare_training(
-            _training_df, horizon
-        )
-
-        if len(train) < 100:
-            continue
-
-        if len(np.unique(y)) < 3:
-            continue
-
-        model = build_model()
-        model.fit(train[FEATURES], y)
-
-        models[horizon] = model
-
-    return models
-
-
-def forecast_latest(features, models, min_confidence):
-    latest = features.iloc[[-1]]
-
-    if latest[FEATURES].notna().sum(axis=1).iloc[0] < 12:
-        return pd.DataFrame()
-
-    output = []
-
-    for horizon in HORIZONS:
-        if horizon not in models:
-            continue
-
-        model = models[horizon]
-
-        probabilities = model.predict_proba(
-            latest[FEATURES]
-        )[0]
-
-        probs = np.zeros(3)
-
-        for j, cls in enumerate(model.classes_):
-            probs[int(cls)] = probabilities[j]
-
-        predicted_class = int(np.argmax(probs))
-        confidence = float(probs[predicted_class])
-
-        direction = LABELS[predicted_class]
-
-        if direction != "SIDEWAYS":
-            if confidence < min_confidence:
-                direction = "WAIT"
-
-        output.append({
-            "Horizon": f"{horizon} min",
-            "Signal": direction,
-            "Confidence": confidence,
-            "P(DOWN)": probs[0],
-            "P(SIDEWAYS)": probs[1],
-            "P(UP)": probs[2]
-        })
-
-    return pd.DataFrame(output)
-
-
-# ============================================================
-# WALK-FORWARD BACKTEST
-# ============================================================
-
-def fit_predict(
-    x,
-    horizon,
-    min_train_days=15,
-    refit_every=5
-):
-    target = f"future_{horizon}"
-
-    days = np.array(
-        sorted(x["session"].unique())
-    )
-
-    if len(days) < min_train_days + 2:
-        raise ValueError(
-            f"Need {min_train_days + 2} sessions; "
-            f"found {len(days)}"
-        )
-
-    output = []
-    model = None
-
-    for i in range(min_train_days, len(days)):
-
-        if (
-            model is None
-            or (i - min_train_days) % refit_every == 0
-        ):
-            train_days = days[:i]
-
-            train_data = x[
-                x["session"].isin(train_days)
-            ]
-
-            train, y = prepare_training(
-                train_data, horizon
-            )
-
-            if len(np.unique(y)) < 3:
-                continue
-
-            model = build_model()
-            model.fit(train[FEATURES], y)
-
-        test = x[
-            x["session"] == days[i]
-        ].copy()
-
-        test = test[
-            test[FEATURES].notna().sum(axis=1) >= 12
-        ]
-
-        if test.empty or model is None:
-            continue
-
-        probabilities = model.predict_proba(
-            test[FEATURES]
-        )
-
-        probs = np.zeros((len(test), 3))
-
-        for j, cls in enumerate(model.classes_):
-            probs[:, int(cls)] = probabilities[:, j]
-
-        test["p_down"] = probs[:, 0]
-        test["p_sideways"] = probs[:, 1]
-        test["p_up"] = probs[:, 2]
-
-        test["prediction"] = LABELS[
-            np.argmax(probs, axis=1)
-        ]
-
-        test["confidence"] = probs.max(axis=1)
-
-        threshold = THRESHOLDS[horizon]
-
-        test["actual"] = np.where(
-            test[target] > threshold,
-            "UP",
-            np.where(
-                test[target] < -threshold,
-                "DOWN",
-                "SIDEWAYS"
-            )
-        )
-
-        test.loc[
-            test[target].isna(),
-            "actual"
-        ] = None
-
-        test["horizon"] = horizon
-
-        output.append(test[[
-            "close", "session", "horizon",
-            "prediction", "confidence",
-            "p_down", "p_sideways",
-            "p_up", "actual", target
-        ]])
-
-    if not output:
-        raise ValueError(
-            "Insufficient training examples"
-        )
-
-    return pd.concat(output)
-
-
-def calculate_metrics(predictions):
-    z = predictions.dropna(
-        subset=["actual"]
-    )
-
-    if z.empty:
-        return None
-
-    probs = z[
-        ["p_down", "p_sideways", "p_up"]
-    ].to_numpy()
-
-    actual_ids = z["actual"].map({
-        "DOWN": 0,
-        "SIDEWAYS": 1,
-        "UP": 2
-    }).to_numpy()
-
-    baseline = z["actual"].value_counts(
-        normalize=True
-    ).max()
-
-    return {
-        "Evaluated": len(z),
-        "Accuracy": accuracy_score(
-            z["actual"], z["prediction"]
-        ),
-        "Baseline": baseline,
-        "Log loss": log_loss(
-            actual_ids,
-            probs,
-            labels=[0, 1, 2]
-        ),
-        "Actionable %": (
-            z["prediction"] != "SIDEWAYS"
-        ).mean()
-    }
-
-# ============================================================
-# PRICE ACTION PATTERN RECOGNITION
-# ============================================================
-
-def detect_price_patterns(raw):
-    """
-    Detect price-action events on completed 5-minute
-    QQQ candles.
-
-    Uses only current and prior candles.
-    No future price data is used.
-    """
-
-    if raw.empty:
-        return pd.DataFrame()
-
-    # Work within individual regular trading sessions.
-    pieces = []
-
-    for session_date, day in raw.groupby(raw.index.date):
-        bars = day.resample(
-            "5min",
-            origin="start_day",
-            label="left",
-            closed="left"
-        ).agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum"
-        }).dropna()
-
-        # Only include completed five-minute candles.
-        counts = day["close"].resample(
-            "5min",
-            origin="start_day"
-        ).count()
-
-        bars = bars[counts.reindex(
-            bars.index, fill_value=0
-        ) == 5].copy()
-
-        if not bars.empty:
-            pieces.append(bars)
-
-    if not pieces:
-        return pd.DataFrame()
-
-    x = pd.concat(pieces).sort_index()
-
-    session = pd.Series(x.index.date, index=x.index)
-
-    def prior(s, n=1):
-        return s.groupby(session).shift(n)
-
-    o = x["open"]
-    h = x["high"]
-    l = x["low"]
-    c = x["close"]
-
-    body = (c - o).abs()
-    candle_range = (h - l).replace(0, np.nan)
-
-    upper_wick = h - np.maximum(o, c)
-    lower_wick = np.minimum(o, c) - l
-
-    prev_open = prior(o)
-    prev_close = prior(c)
-
-    # Hammer: small real body and long lower wick.
-    hammer = (
-        (lower_wick >= 2 * body) &
-        (upper_wick <= body) &
-        (body / candle_range <= 0.35)
-    )
-
-    # Shooting star: small real body and long upper wick.
-    shooting_star = (
-        (upper_wick >= 2 * body) &
-        (lower_wick <= body) &
-        (body / candle_range <= 0.35)
-    )
-
-    # Bullish engulfing.
-    bullish_engulfing = (
-        (prev_close < prev_open) &
-        (c > o) &
-        (o <= prev_close) &
-        (c >= prev_open)
-    )
-
-    # Bearish engulfing.
-    bearish_engulfing = (
-        (prev_close > prev_open) &
-        (c < o) &
-        (o >= prev_close) &
-        (c <= prev_open)
-    )
-
-    # Previous 12 completed five-minute candles.
-    # Shift prevents current-candle leakage.
-    resistance = h.groupby(session).transform(
-        lambda s: s.rolling(
-            12, min_periods=6
-        ).max().shift(1)
-    )
-
-    support = l.groupby(session).transform(
-        lambda s: s.rolling(
-            12, min_periods=6
-        ).min().shift(1)
-    )
-
-    x["support"] = support
-    x["resistance"] = resistance
-
-    # Volume relative to previous 12 candles.
-    avg_volume = x["volume"].groupby(
-        session
-    ).transform(
-        lambda s: s.rolling(
-            12, min_periods=6
-        ).mean().shift(1)
-    )
-
-    x["volume_ratio"] = (
-        x["volume"] / avg_volume.replace(0, np.nan)
-    )
-
-    bullish_breakout = (
-        (c > resistance) &
-        (prev_close <= prior(resistance)) &
-        (x["volume_ratio"] >= 1.5)
-    )
-
-    bearish_breakdown = (
-        (c < support) &
-        (prev_close >= prior(support)) &
-        (x["volume_ratio"] >= 1.5)
-    )
-
-    # Require hammer/star proximity to recent levels.
-    tolerance = 0.0015
-
-    near_support = (
-        support.notna() &
-        (l <= support * (1 + tolerance)) &
-        (h >= support * (1 - tolerance))
-    )
-
-    near_resistance = (
-        resistance.notna() &
-        (h >= resistance * (1 - tolerance)) &
-        (l <= resistance * (1 + tolerance))
-    )
-
-    x["pattern"] = ""
-    x["direction"] = ""
-
-    patterns = [
-        (
-            hammer & near_support,
-            "Hammer at support",
-            "BULLISH"
-        ),
-        (
-            shooting_star & near_resistance,
-            "Shooting star at resistance",
-            "BEARISH"
-        ),
-        (
-            bullish_engulfing,
-            "Bullish engulfing",
-            "BULLISH"
-        ),
-        (
-            bearish_engulfing,
-            "Bearish engulfing",
-            "BEARISH"
-        ),
-        (
-            bullish_breakout,
-            "Resistance breakout",
-            "BULLISH"
-        ),
-        (
-            bearish_breakdown,
-            "Support breakdown",
-            "BEARISH"
-        )
-    ]
-
-    for condition, name, direction in patterns:
-        x.loc[condition, "pattern"] = name
-        x.loc[condition, "direction"] = direction
-
-    # A 5-minute bar labeled 10:00 is known
-    # only after it completes at 10:05.
-    x["detected_at"] = x.index + pd.Timedelta(
-        minutes=5
-    )
-
-    return x
-# ============================================================
-# PREVIOUS SESSION, OPENING RANGE, CONFIRMED PIVOT TRENDLINES
-# ============================================================
-
-def price_levels(raw, selected_day, or_minutes=15, asof=None):
-    """Levels available by asof (exclusive end of last observed 1m bar).
-
-    PDH/PDL/PDC use the previous available regular session.
-    Trendlines use pivots confirmed by two subsequent candles.
-    """
-    days = sorted(set(raw.index.date))
-    previous = [d for d in days if d < selected_day]
-    today = raw[raw.index.date == selected_day].copy()
-    if asof is not None:
-        today = today[today.index < asof]
-    result = {"PDH": np.nan, "PDL": np.nan, "PDC": np.nan,
-              "OR High": np.nan, "OR Low": np.nan,
-              "Support": np.nan, "Resistance": np.nan,
-              "Support trendline": None, "Resistance trendline": None}
-    if previous:
-        prior = raw[raw.index.date == previous[-1]]
-        result.update(PDH=float(prior.high.max()),
-                      PDL=float(prior.low.min()),
-                      PDC=float(prior.close.iloc[-1]))
-    # Opening range is not final until all required minutes exist.
-    opening = today.between_time("09:30", "15:59").head(or_minutes)
-    if len(opening) == or_minutes:
-        expected = pd.date_range(
-            pd.Timestamp(selected_day).tz_localize(NY) + pd.Timedelta(hours=9, minutes=30),
-            periods=or_minutes, freq="min")
-        if np.array_equal(opening.index.asi8, expected.asi8):
-            result["OR High"] = float(opening.high.max())
-            result["OR Low"] = float(opening.low.min())
-    if today.empty:
-        return result
-    # Rolling levels based on prior 20 candles, not current candle.
-    result["Support"] = float(today.low.shift(1).tail(20).min()) if len(today)>1 else np.nan
-    result["Resistance"] = float(today.high.shift(1).tail(20).max()) if len(today)>1 else np.nan
-    # Pivot at i becomes known at i+2. Only confirmed pivots are used.
-    n = len(today)
-    if n >= 7:
-        lows, highs = today.low.to_numpy(), today.high.to_numpy()
-        pivot_lows = [i for i in range(2, n-2)
-                      if lows[i] < min(lows[i-2:i]) and lows[i] <= min(lows[i+1:i+3])]
-        pivot_highs = [i for i in range(2, n-2)
-                       if highs[i] > max(highs[i-2:i]) and highs[i] >= max(highs[i+1:i+3])]
-        for name, idxs, values in [
-            ("Support trendline", pivot_lows, lows),
-            ("Resistance trendline", pivot_highs, highs)
-        ]:
-            if len(idxs) >= 2:
-                a, b = idxs[-2:]
-                slope = (values[b] - values[a]) / (b-a)
-                result[name] = (today.index[a], float(values[a]),
-                                today.index[-1], float(values[a]+slope*(n-1-a)))
+def history(symbol, feed, key, secret_key, today):
+    end_day = dt.date.fromisoformat(today)
+    start = dt.datetime.combine(end_day - dt.timedelta(days=85), dt.time.min, UTC)
+    end = dt.datetime.combine(end_day, dt.time.min, UTC)
+    return alpaca_bars(symbol, start.isoformat(), end.isoformat(), feed, key, secret_key)
+
+
+def live(symbol, feed, key, secret_key):
+    now = dt.datetime.now(UTC) - dt.timedelta(minutes=2)
+    end = dt.datetime.fromtimestamp(int(now.timestamp() // 30) * 30, UTC)
+    start = end - dt.timedelta(days=4)
+    return alpaca_bars(symbol, start.isoformat(), end.isoformat(), feed, key, secret_key)
+
+
+def merge_data(a, b):
+    x = pd.concat([a, b]).sort_index()
+    return x[~x.index.duplicated(keep='last')]
+
+
+def to_five_minute(raw):
+    """Five one-minute bars per candle, no partial candles, no overnight mixing."""
+    out = []
+    for _, d in raw.groupby(raw.index.date):
+        agg = d.resample('5min', label='left', closed='left').agg({
+            'open': 'first', 'high': 'max', 'low': 'min',
+            'close': 'last', 'volume': 'sum'})
+        counts = d['close'].resample('5min', label='left', closed='left').count()
+        agg = agg[counts.reindex(agg.index, fill_value=0) == 5].dropna()
+        if not agg.empty:
+            out.append(agg)
+    if not out:
+        return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+    return pd.concat(out).sort_index()
+
+
+def levels_for_day(raw, date, opening_minutes=15):
+    dates = sorted(set(raw.index.date))
+    prev = [d for d in dates if d < date]
+    result = {'PDH': np.nan, 'PDL': np.nan, 'PDC': np.nan,
+              'OR High': np.nan, 'OR Low': np.nan}
+    if prev:
+        p = raw[raw.index.date == prev[-1]]
+        result.update(PDH=float(p.high.max()), PDL=float(p.low.min()), PDC=float(p.close.iloc[-1]))
+    today = raw[raw.index.date == date]
+    start = pd.Timestamp(date, tz=NY) + pd.Timedelta(hours=9, minutes=30)
+    expected = pd.date_range(start, periods=opening_minutes, freq='min')
+    opening = today.reindex(expected)
+    if opening['close'].notna().all():
+        result['OR High'] = float(opening.high.max())
+        result['OR Low'] = float(opening.low.min())
     return result
 
 
-def draw_levels(fig, levels, chart_index):
-    """Overlay horizontal price levels and last confirmed trendlines."""
-    palette = {"PDH": "#2ca02c", "PDL": "#d62728", "PDC": "#7f7f7f",
-               "OR High": "#17becf", "OR Low": "#ff7f0e",
-               "Support": "#1f77b4", "Resistance": "#9467bd"}
-    for name, color in palette.items():
-        value = levels.get(name)
-        if value is not None and pd.notna(value):
-            fig.add_hline(y=float(value), line_color=color,
-                          line_dash="dot" if name.startswith("OR") else "dash",
-                          line_width=1, annotation_text=f"{name} {value:.2f}",
-                          annotation_position="top right")
-    for name, color in [("Support trendline", "#008000"),
-                        ("Resistance trendline", "#cc0000")]:
-        line = levels.get(name)
-        if line is not None:
-            x0, y0, x1, y1 = line
-            fig.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1],
-                                     mode="lines", name=name,
-                                     line=dict(color=color, width=2, dash="dash")))
+def make_boxes(raw, lookback=12, max_width_pct=0.9, vol_multiplier=1.2,
+               require_trend=True, require_volume=True):
+    """Rolling Darvas-style boxes: prior N complete 5m candles in same session.
+    This is a testable adaptation, not the original Darvas pivot-confirmation method.
+    Signal is known only at the end of its 5m candle.
+    """
+    x = to_five_minute(raw)
+    if x.empty:
+        return x
+    blocks = []
+    for _, d in x.groupby(x.index.date):
+        d = d.copy()
+        n = lookback
+        d['box_high'] = d.high.rolling(n, min_periods=n).max().shift(1)
+        d['box_low'] = d.low.rolling(n, min_periods=n).min().shift(1)
+        d['box_width_pct'] = (d.box_high - d.box_low) / d.close * 100
+        d['vol_ratio'] = d.volume / d.volume.rolling(n, min_periods=n).mean().shift(1).replace(0, np.nan)
+        d['ema9'] = d.close.ewm(span=9, adjust=False).mean()
+        d['ema20'] = d.close.ewm(span=20, adjust=False).mean()
+        typical = (d.high + d.low + d.close) / 3
+        d['vwap'] = (typical * d.volume).cumsum() / d.volume.cumsum().replace(0, np.nan)
+        d['atr'] = pd.concat([
+            d.high - d.low,
+            (d.high - d.close.shift()).abs(),
+            (d.low - d.close.shift()).abs()], axis=1).max(axis=1).ewm(
+                alpha=1/14, adjust=False, min_periods=14).mean()
+        eligible = d.box_high.notna() & (d.box_width_pct <= max_width_pct)
+        long_ok = eligible & (d.close > d.box_high) & (d.close > d.open)
+        short_ok = eligible & (d.close < d.box_low) & (d.close < d.open)
+        if require_trend:
+            long_ok &= (d.ema9 > d.ema20) & (d.close > d.vwap)
+            short_ok &= (d.ema9 < d.ema20) & (d.close < d.vwap)
+        if require_volume:
+            long_ok &= d.vol_ratio >= vol_multiplier
+            short_ok &= d.vol_ratio >= vol_multiplier
+        d['signal'] = np.select([long_ok, short_ok], [1, -1], default=0)
+        d['signal_time'] = d.index + pd.Timedelta(minutes=5)
+        blocks.append(d)
+    return pd.concat(blocks).sort_index()
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+def backtest(boxes, hold_bars=6, stop_atr=1.2, reward_risk=1.5, cost_bps=2.0):
+    """Next 5m open entry; stop-first when stop and target both touch a bar.
+    One position at a time per session; forced same-day exit; no overnight positions.
+    All returns net of assumed round-trip cost. No leverage assumed.
+    """
+    trades = []
+    for day, d in boxes.groupby(boxes.index.date):
+        d = d.reset_index().rename(columns={'index': 'timestamp'})
+        i = 0
+        while i < len(d) - 1:
+            s = int(d.at[i, 'signal'])
+            if not s or pd.isna(d.at[i, 'atr']):
+                i += 1
+                continue
+            entry_i = i + 1
+            entry = float(d.at[entry_i, 'open'])
+            risk = max(float(d.at[i, 'atr']) * stop_atr, entry * 0.0005)
+            stop = entry - s * risk
+            target = entry + s * risk * reward_risk
+            last_i = min(entry_i + hold_bars - 1, len(d) - 1)
+            exit_i = last_i
+            exit_price = float(d.at[last_i, 'close'])
+            reason = 'time/session exit'
+            for j in range(entry_i, last_i + 1):
+                lo, hi = float(d.at[j, 'low']), float(d.at[j, 'high'])
+                stop_hit = lo <= stop if s == 1 else hi >= stop
+                target_hit = hi >= target if s == 1 else lo <= target
+                if stop_hit:
+                    # Conservative gap handling: worse of stop or bar open.
+                    opened = float(d.at[j, 'open'])
+                    fill = min(stop, opened) if s == 1 else max(stop, opened)
+                    exit_i, exit_price, reason = j, fill, 'stop'
+                    break
+                if target_hit:
+                    exit_i, exit_price, reason = j, target, 'target'
+                    break
+            gross_bps = s * (exit_price / entry - 1) * 10000
+            net_bps = gross_bps - cost_bps
+            trades.append({
+                'session': str(day), 'signal_time': d.at[i, 'signal_time'],
+                'entry_time': d.at[entry_i, 'timestamp'],
+                'exit_time': d.at[exit_i, 'timestamp'] + pd.Timedelta(minutes=5),
+                'side': 'LONG' if s == 1 else 'SHORT',
+                'entry': entry, 'exit': exit_price, 'stop': stop, 'target': target,
+                'reason': reason, 'gross_bps': gross_bps, 'net_bps': net_bps,
+                'win': net_bps > 0})
+            i = exit_i + 1
+    return pd.DataFrame(trades)
 
-st.title(
-    "Stock | Intraday Prediction & Walk-forward Validation"
-)
 
-st.caption(
-    "Research tool only. No orders are placed. "
-    "Predictions are experimental."
-)
+def summarize(trades):
+    if trades.empty:
+        return {'Trades': 0, 'Win rate': np.nan, 'Avg net bps': np.nan,
+                'Total net bps': np.nan, 'Profit factor': np.nan}
+    wins = trades.loc[trades.net_bps > 0, 'net_bps'].sum()
+    losses = -trades.loc[trades.net_bps < 0, 'net_bps'].sum()
+    return {'Trades': len(trades), 'Win rate': trades.win.mean(),
+            'Avg net bps': trades.net_bps.mean(),
+            'Total net bps': trades.net_bps.sum(),
+            'Profit factor': wins / losses if losses else np.nan}
+
+
+def chart_for_day(raw, boxes, day, opening_minutes, visible_bars):
+    d = raw[raw.index.date == day].copy()
+    b = boxes[boxes.index.date == day].copy()
+    if visible_bars:
+        d = d.tail(visible_bars)
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low,
+                                 close=d.close, name='Price'))
+    if not b.empty:
+        shown = b[(b.index + pd.Timedelta(minutes=5)) >= d.index.min()]
+        for name, color in [('box_high', '#e67e22'), ('box_low', '#16a085'),
+                            ('ema9', '#eab308'), ('ema20', '#2563eb'), ('vwap', '#8b5cf6')]:
+            fig.add_trace(go.Scatter(x=shown.index, y=shown[name], mode='lines',
+                                     name=name.upper(), line=dict(color=color, width=1.5)))
+        for s, color, marker, label in [(1, 'green', 'triangle-up', 'Bullish box breakout'),
+                                        (-1, 'red', 'triangle-down', 'Bearish box breakdown')]:
+            ev = shown[shown.signal == s]
+            fig.add_trace(go.Scatter(x=ev.signal_time,
+                                     y=ev.close * (0.9997 if s == 1 else 1.0003),
+                                     mode='markers', name=label,
+                                     marker=dict(color=color, size=12, symbol=marker)))
+    levels = levels_for_day(raw, day, opening_minutes)
+    palette = {'PDH': '#16a34a', 'PDL': '#dc2626', 'PDC': '#64748b',
+               'OR High': '#0891b2', 'OR Low': '#ea580c'}
+    for name, val in levels.items():
+        if np.isfinite(val):
+            fig.add_hline(y=val, line_dash='dot', line_color=palette[name],
+                          annotation_text=f'{name} {val:.2f}', annotation_position='top right')
+    # Two confirmed swing pivots on 5-minute bars, two future bars for confirmation.
+    if len(b) >= 9:
+        for field, color, is_high in [('high', '#ef4444', True), ('low', '#22c55e', False)]:
+            arr = b[field].to_numpy()
+            pivots = []
+            for j in range(2, len(arr)-2):
+                left = arr[j-2:j]
+                right = arr[j+1:j+3]
+                if ((arr[j] > max(left) and arr[j] >= max(right)) if is_high else
+                    (arr[j] < min(left) and arr[j] <= min(right))):
+                    pivots.append(j)
+            # Only the latest pair, drawn after both pivots have confirmed.
+            if len(pivots) >= 2:
+                a, z = pivots[-2:]
+                slope = (arr[z] - arr[a]) / (z - a)
+                fig.add_trace(go.Scatter(x=[b.index[a], b.index[-1]],
+                    y=[arr[a], arr[a] + slope * (len(b)-1-a)], mode='lines',
+                    name='Resistance trendline' if is_high else 'Support trendline',
+                    line=dict(color=color, width=2, dash='dash')))
+    fig.update_layout(height=600, title=f'{day} | Darvas-style box levels and breakout signals',
+                      xaxis_title='Eastern Time', yaxis_title='Price ($)',
+                      xaxis_rangeslider_visible=False)
+    return fig, levels
+
+
+st.title('Stock Movement V5 | Darvas Box Breakout')
+st.caption('Research and paper-testing only. No orders are placed. WAIT means no confirmed setup.')
 
 with st.sidebar:
-    st.header("Stock Live Chart")
-
-    symbol = st.text_input("US stock/ETF ticker", value="QQQ", max_chars=10).strip().upper()
-    if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", symbol):
-        st.error("Enter a valid US ticker, e.g. QQQ, AAPL, TSLA.")
+    symbol = st.text_input('U.S. stock / ETF symbol', 'QQQ').strip().upper()
+    if not re.fullmatch(r'[A-Z][A-Z0-9.-]{0,9}', symbol):
+        st.error('Invalid ticker symbol')
         st.stop()
-    opening_range_minutes = st.selectbox("Opening range (minutes)", [5, 15, 30], index=1)
-
-    chart_window = st.selectbox(
-        "Chart timeframe",
-        list(CHART_WINDOWS.keys()),
-        index=6
-    )
-
-    feed = st.selectbox(
-        "Feed",
-        ["iex", "sip"],
-        index=0 if DEFAULT_FEED == "iex" else 1
-    )
-
-    min_confidence = st.slider(
-        "Minimum directional confidence",
-        min_value=0.35,
-        max_value=0.90,
-        value=0.55,
-        step=0.05
-    )
-
-    st.caption("Auto-refresh: every 30 seconds")
-
-    with st.expander("Alpaca Connection Status"):
-        st.write(
-            "API Key:",
-            "Configured" if API_KEY else "Missing"
-        )
-        st.write(
-            "Secret:",
-            "Configured" if API_SECRET else "Missing"
-        )
-
+    feed = st.selectbox('Alpaca feed', ['iex', 'sip'],
+                        index=1 if secret('ALPACA_FEED', default='iex') == 'sip' else 0)
+    opening = st.selectbox('Opening range (minutes)', [5, 15, 30], index=1)
+    window = st.selectbox('Chart timeframe', ['5 minutes', '15 minutes', '1 hour',
+                                              '2 hours', '4 hours', 'Since market open'], index=5)
+    windows = {'5 minutes': 5, '15 minutes': 15, '1 hour': 60,
+               '2 hours': 120, '4 hours': 240, 'Since market open': None}
     st.divider()
+    st.subheader('Box strategy')
+    lookback = st.slider('Box lookback (5m candles)', 6, 24, 12)
+    max_width = st.slider('Maximum box width (%)', 0.2, 2.0, 0.9, 0.1)
+    vol_mult = st.slider('Breakout relative volume', 1.0, 3.0, 1.2, 0.1)
+    hold_minutes = st.selectbox('Maximum holding time', [5, 15, 30, 60], index=2)
+    stop_atr = st.slider('Stop distance (ATR multiplier)', 0.5, 3.0, 1.2, 0.1)
+    reward_risk = st.slider('Profit target (reward/risk)', 0.5, 4.0, 1.5, 0.1)
+    cost_bps = st.number_input('Estimated round-trip cost (bps)', 0.0, 30.0, 2.0, 0.5)
+    st.divider()
+    uploaded = st.file_uploader('Historical 1-minute CSV (optional)', type=['csv'])
+    naive_tz = st.selectbox('Timezone for CSV timestamps without offset',
+                            ['America/New_York', 'UTC'], index=0)
+    run_test = st.button('Run historical backtest', type='primary')
 
-    st.header("Historical Validation")
+key = secret('ALPACA_API_KEY', 'APCA_API_KEY_ID', 'ALPACA_KEY')
+secret_key = secret('ALPACA_SECRET_KEY', 'APCA_API_SECRET_KEY', 'ALPACA_SECRET')
 
-    uploaded = st.file_uploader(
-        f"Optional {symbol} 1-minute CSV",
-        type=["csv"]
-    )
-
-    min_train = st.slider(
-        "Initial training sessions",
-        10, 35, 15
-    )
-
-    refit = st.slider(
-        "Refit every N sessions",
-        1, 10, 5
-    )
-
-    run = st.button(
-        "Run walk-forward test",
-        type="primary"
-    )
-
-show_patterns = st.checkbox(
-    "Show price action patterns",
-    value=True
-)
-
-show_levels = st.checkbox(
-    "Show support and resistance",
-    value=True
-)
-
-show_pattern_table = st.checkbox(
-    "Show detected pattern details",
-    value=True
-)
-# ============================================================
-# HISTORICAL VALIDATION - RUN ONLY ON BUTTON CLICK
-# ============================================================
-
-if run:
+if uploaded is not None:
     try:
-        if uploaded is not None:
-            raw = clean(pd.read_csv(uploaded))
-        else:
-            if not API_KEY or not API_SECRET:
-                raise ValueError(
-                    "Alpaca credentials missing"
-                )
-
-            now = dt.datetime.now(UTC)
-
-            raw = fetch_alpaca(
-                (
-                    now - dt.timedelta(days=75)
-                ).isoformat(),
-                (
-                    now - dt.timedelta(minutes=2)
-                ).isoformat(),
-                feed, symbol
-            )
-
-        if raw.empty:
-            raise ValueError(
-                "No regular-session QQQ data found"
-            )
-
-        st.session_state["backtest_raw"] = raw
-        st.session_state["backtest_symbol"] = symbol
-
-        with st.spinner(
-            "Computing historical predictions..."
-        ):
-            features = make_features(raw)
-
-            results = {
-                h: fit_predict(
-                    features, h, min_train, refit
-                )
-                for h in HORIZONS
-            }
-
-        st.session_state["backtest_results"] = results
-
+        raw_uploaded = clean(pd.read_csv(uploaded), naive_tz)
+        st.success(f'CSV loaded: {len(raw_uploaded):,} regular-session 1-minute bars')
     except Exception as exc:
-        st.error(
-            f"Walk-forward test failed: {exc}"
-        )
+        st.error(f'CSV parsing error: {exc}')
+        raw_uploaded = None
+else:
+    raw_uploaded = None
 
 
-if "backtest_results" in st.session_state and st.session_state.get("backtest_symbol") == symbol:
-    results = st.session_state["backtest_results"]
-    raw = st.session_state["backtest_raw"]
-
-    st.subheader(f"{symbol} Historical Backtest Results")
-
-    summary = []
-
-    for h, result in results.items():
-        metrics = calculate_metrics(result)
-
-        if metrics:
-            summary.append({
-                "Horizon": f"{h} min",
-                **metrics
-            })
-
-    if summary:
-        summary_df = pd.DataFrame(summary)
-
-        st.dataframe(
-            summary_df.style.format({
-                "Accuracy": "{:.1%}",
-                "Baseline": "{:.1%}",
-                "Log loss": "{:.3f}",
-                "Actionable %": "{:.1%}"
-            }),
-            hide_index=True,
-            use_container_width=True
-        )
-
-    selected_horizon = st.selectbox(
-        "Historical prediction horizon",
-        HORIZONS,
-        index=1
-    )
-
-    result = results[selected_horizon]
-
-    days = sorted(result["session"].unique())
-
-    chosen_day = st.selectbox(
-        "Historical replay day",
-        days,
-        index=len(days) - 1
-    )
-
-    selected = result[
-        result["session"] == chosen_day
-    ]
-
-    st.dataframe(
-        selected[[
-            "close", "prediction",
-            "confidence", "p_up",
-            "p_down", "p_sideways",
-            "actual"
-        ]].tail(30),
-        use_container_width=True
-    )
-
-    all_predictions = pd.concat(
-        results.values()
-    ).reset_index()
-
-    csv = all_predictions.to_csv(
-        index=False
-    ).encode("utf-8")
-
-    st.download_button(
-        "Download historical predictions",
-        data=csv,
-        file_name=f"{symbol}_predictions.csv",
-        mime="text/csv"
-    )
-
-
-# ============================================================
-# HISTORICAL QQQ CHART REPLAY - CSV OR BACKTEST DATA
-# ============================================================
-
-st.divider()
-with st.expander("Historical stock chart replay + price-action patterns", expanded=True):
-    st.caption(
-        "Upload a 1-minute CSV for the selected ticker, "
-        "or click Run walk-forward test to load Alpaca data. "
-        "This replay does not place trades."
-    )
-    replay_raw = None
-    if uploaded is not None:
-        try:
-            # Re-read the uploaded CSV independently of the backtest button.
-            replay_raw = clean(pd.read_csv(uploaded))
-        except Exception as exc:
-            st.error(f"CSV could not be read: {exc}")
-    elif "backtest_raw" in st.session_state and st.session_state.get("backtest_symbol") == symbol:
-        replay_raw = st.session_state["backtest_raw"]
-
-    if replay_raw is None or replay_raw.empty:
-        st.info("Upload a matching stock CSV in the sidebar to view historical charts.")
-    else:
-        replay_days = sorted(set(replay_raw.index.date))
-        replay_day = st.selectbox(
-            "Trading day", replay_days, index=len(replay_days) - 1,
-            key="replay_day"
-        )
-        replay_window = st.selectbox(
-            "Historical chart timeframe",
-            list(CHART_WINDOWS),
-            index=6,
-            key="replay_window"
-        )
-        show_replay_patterns = st.checkbox(
-            "Display bullish/bearish pattern markers", value=True,
-            key="replay_patterns"
-        )
-        show_replay_levels = st.checkbox(
-            "Display rolling support/resistance", value=True,
-            key="replay_levels"
-        )
-
-        # Features are calculated on all sessions, preserving EMA history.
-        replay_features = make_features(replay_raw)
-        replay_day_data = replay_features[
-            replay_features.index.date == replay_day
-        ].copy()
-        replay_patterns_all = detect_price_patterns(replay_raw)
-        replay_patterns = replay_patterns_all[
-            replay_patterns_all.index.date == replay_day
-        ].copy() if not replay_patterns_all.empty else pd.DataFrame()
-
-        window_size = CHART_WINDOWS[replay_window]
-        if window_size is not None:
-            replay_day_data = replay_day_data.tail(window_size)
-
-        if replay_day_data.empty:
-            st.warning("No regular-session candles on this day.")
-        else:
-            chart_end = replay_day_data.index[-1] + pd.Timedelta(minutes=1)
-            chart_start = replay_day_data.index[0]
-            chart = go.Figure()
-            chart.add_trace(go.Candlestick(
-                x=replay_day_data.index,
-                open=replay_day_data["open"],
-                high=replay_day_data["high"],
-                low=replay_day_data["low"],
-                close=replay_day_data["close"],
-                name=symbol
-            ))
-            for col, color in [
-                ("ema9", "orange"),
-                ("ema20", "blue"),
-                ("vwap", "purple")
-            ]:
-                chart.add_trace(go.Scatter(
-                    x=replay_day_data.index,
-                    y=replay_day_data[col],
-                    mode="lines", name=col.upper(),
-                    line=dict(color=color, width=1.5)
-                ))
-
-            replay_levels = price_levels(replay_raw, replay_day, opening_range_minutes,
-                                         asof=chart_end)
-            if show_replay_levels:
-                draw_levels(chart, replay_levels, replay_day_data.index)
-
-            if not replay_patterns.empty:
-                # Only show events whose 5-minute candle had completed.
-                visible = replay_patterns[
-                    (replay_patterns["detected_at"] >= chart_start) &
-                    (replay_patterns["detected_at"] <= chart_end)
-                ].copy()
-                if show_replay_patterns:
-                    for direction, marker_symbol, color, offset in [
-                        ("BULLISH", "triangle-up", "green", 0.9995),
-                        ("BEARISH", "triangle-down", "red", 1.0005)
-                    ]:
-                        matched = visible[
-                            (visible["direction"] == direction) &
-                            (visible["pattern"] != "")
-                        ]
-                        level_col = "low" if direction == "BULLISH" else "high"
-                        chart.add_trace(go.Scatter(
-                            x=matched["detected_at"],
-                            y=matched[level_col] * offset,
-                            text=matched["pattern"],
-                            mode="markers", name=f"{direction} pattern",
-                            marker=dict(symbol=marker_symbol, color=color, size=12),
-                            hovertemplate="%{text}<br>%{x}<extra></extra>"
-                        ))
-
-            chart.update_layout(
-                title=f"{symbol} historical replay - {replay_day}",
-                height=550,
-                xaxis_rangeslider_visible=False,
-                xaxis_title="Eastern Time",
-                yaxis_title=f"{symbol} price ($)"
-            )
-            st.plotly_chart(chart, use_container_width=True)
-            if not replay_patterns.empty:
-                events = replay_patterns[
-                    (replay_patterns["pattern"] != "") &
-                    (replay_patterns["detected_at"] <= chart_end)
-                ]
-                st.caption(f"Detected price-action events through chart end: {len(events)}")
-                if not events.empty:
-                    st.dataframe(
-                        events[["detected_at", "pattern", "direction", "close",
-                                "support", "resistance", "volume_ratio"]].tail(30),
-                        use_container_width=True
-                    )
-
-# ============================================================
-# LIVE FORECAST - REFRESH EVERY 30 SECONDS
-# ============================================================
-
-st.divider()
-st.subheader(f"{symbol} Live Chart & Forecast")
-
-@st.fragment(run_every="30s")
+@st.fragment(run_every='30s')
 def live_dashboard():
-
-    if not API_KEY or not API_SECRET:
-        st.warning("Missing Alpaca credentials.")
+    if not key or not secret_key:
+        st.info('Configure Alpaca keys in Streamlit Secrets to enable live charts.')
         return
-
     try:
-        now_ny = dt.datetime.now(NY)
-
-        # Use midnight of current New York date
-        # as the boundary for completed sessions.
-        today = now_ny.date()
-
-        with st.spinner("Loading QQQ market data..."):
-
-            history = historical_data(
-                today.isoformat(),
-                feed, symbol
-            )
-
-            recent = get_live_data(feed, symbol)
-
-            raw = combine_data(
-                history, recent
-            )
-
+        today = dt.datetime.now(NY).date()
+        old = history(symbol, feed, key, secret_key, today.isoformat())
+        recent = live(symbol, feed, key, secret_key)
+        raw = merge_data(old, recent)
         if raw.empty:
-            st.warning(f"No {symbol} market data available")
+            st.warning('No recent market data')
             return
-
-        latest_ts = raw.index[-1]
-        latest_close = raw["close"].iloc[-1]
-
-        st.metric(
-            f"{symbol} Latest Completed Close",
-            f"${latest_close:.2f}"
-        )
-
-        st.caption(
-            f"Feed: {feed.upper()} | "
-            f"Latest candle: {latest_ts} | "
-            "Refresh: 30 seconds"
-        )
-
-        age_minutes = (
-            dt.datetime.now(NY) - latest_ts
-        ).total_seconds() / 60
-
-        if age_minutes > 5:
-            st.warning(
-                f"Latest candle is {age_minutes:.0f} "
-                "minutes old. Market may be closed "
-                "or data may be delayed."
-            )
-
-        features = make_features(raw)
-
-        # ====================================================
-        # CHART
-        # ====================================================
-
-        latest_day = latest_ts.date()
-
-        chart_data = features[
-            features.index.date == latest_day
-        ]
-
-        window = CHART_WINDOWS[chart_window]
-
-        if window is not None:
-            chart_data = chart_data.tail(window)
-
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Candlestick(
-                x=chart_data.index,
-                open=chart_data["open"],
-                high=chart_data["high"],
-                low=chart_data["low"],
-                close=chart_data["close"],
-                name=symbol
-            )
-        )
-
-        for name, color in [
-            ("ema9", "orange"),
-            ("ema20", "blue"),
-            ("vwap", "purple")
-        ]:
-            fig.add_trace(
-                go.Scatter(
-                    x=chart_data.index,
-                    y=chart_data[name],
-                    mode="lines",
-                    name=name.upper(),
-                    line=dict(
-                        color=color,
-                        width=1.5
-                    )
-                )
-            )
-        # ============================================================
-        # ADD PRICE ACTION PATTERNS TO QQQ CHART
-        # ============================================================
-
-        patterns = detect_price_patterns(raw)
-
-        if not patterns.empty:
-            # Only show patterns from the chart's trading day.
-            patterns = patterns[
-                patterns.index.date == latest_day
-            ].copy()
-
-            # The latest five-minute candle must be complete.
-            patterns = patterns[
-                patterns["detected_at"] <= latest_ts
-            ]
-
-            # Use event time, not the start of the candle.
-            if show_patterns:
-                detected = patterns[
-                    patterns["pattern"] != ""
-                ].copy()
-
-                if not chart_data.empty:
-                    detected = detected[
-                        detected["detected_at"] >= chart_data.index.min()
-                    ]
-
-                bullish = detected[
-                    detected["direction"] == "BULLISH"
-                ]
-
-                bearish = detected[
-                    detected["direction"] == "BEARISH"
-                ]
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=bullish["detected_at"],
-                        y=bullish["low"] * 0.9995,
-                        mode="markers",
-                        name="Bullish pattern",
-                        marker=dict(
-                            symbol="triangle-up",
-                            size=12,
-                            color="green"
-                        ),
-                        text=bullish["pattern"],
-                        hovertemplate=(
-                            "%{text}<br>"
-                            "%{x}<br>"
-                            "Price: %{y:.2f}"
-                            "<extra></extra>"
-                        )
-                    )
-                )
-
-                fig.add_trace(
-                    go.Scatter(
-                        x=bearish["detected_at"],
-                        y=bearish["high"] * 1.0005,
-                        mode="markers",
-                        name="Bearish pattern",
-                        marker=dict(
-                            symbol="triangle-down",
-                            size=12,
-                            color="red"
-                        ),
-                        text=bearish["pattern"],
-                        hovertemplate=(
-                            "%{text}<br>"
-                            "%{x}<br>"
-                            "Price: %{y:.2f}"
-                            "<extra></extra>"
-                        )
-                    )
-                )
-
-
-        current_levels = price_levels(raw, latest_day, opening_range_minutes,
-                                      asof=latest_ts + pd.Timedelta(minutes=1))
-        if show_levels:
-            draw_levels(fig, current_levels, chart_data.index)
-        level_cols = st.columns(5)
-        for col, key in zip(level_cols, ["PDH", "PDL", "PDC", "OR High", "OR Low"]):
-            value = current_levels[key]
-            col.metric(key, f"${value:.2f}" if pd.notna(value) else "Pending")
-
-        fig.update_layout(height=520, xaxis_rangeslider_visible=False)
+        boxes = make_boxes(raw, lookback, max_width, vol_mult)
+        latest_day = raw.index[-1].date()
+        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window])
+        st.subheader(f'{symbol} | Live chart (refresh every 30 seconds)')
+        st.metric('Last completed minute close', f'${raw.close.iloc[-1]:.2f}')
+        st.caption(f'Latest candle: {raw.index[-1]} | Feed: {feed.upper()} | 1-minute bars; box signals use completed 5-minute candles')
+        if (dt.datetime.now(NY) - raw.index[-1]).total_seconds() > 300:
+            st.warning('Data is stale or market is closed. Do not treat this as a live entry.')
         st.plotly_chart(fig, use_container_width=True)
-        if show_pattern_table and not patterns.empty:
-            st.subheader(f"{symbol} Price Action Patterns")
-            events = patterns[patterns["pattern"] != ""].copy()
-            if events.empty:
-                st.info("No qualifying price-action patterns detected in the available session.")
-            else:
-                events = events[["detected_at", "close", "pattern", "direction", "support", "resistance", "volume_ratio"]].tail(20)
-                st.dataframe(events, use_container_width=True)
-                latest_event = events.iloc[-1]
-                st.caption(f"Most recent pattern: {latest_event['pattern']} ({latest_event['direction']})")
-
-        # ====================================================
-        # MODEL TRAINING - COMPLETED SESSIONS ONLY
-        # ====================================================
-
-        days = sorted(
-            features["session"].unique()
-        )
-
-        if len(days) < 17:
-            st.warning(
-                "At least 17 trading sessions "
-                "are required for model training."
-            )
-            return
-
-        training_days = days[:-1]
-
-        training_df = features[
-            features["session"].isin(
-                training_days
-            )
-        ]
-
-        # Create a stable model cache key.
-        # Changes when completed training data changes.
-        training_signature = (
-            f"{symbol}|{feed}|{training_days[-1]}|"
-            f"{len(training_df)}|"
-            f"{training_df.close.iloc[-1]:.6f}|"
-            f"{training_df.volume.sum():.0f}"
-        )
-
-        training_key = hashlib.sha256(
-            training_signature.encode()
-        ).hexdigest()
-
-        models = cached_models(
-            training_key,
-            training_df
-        )
-
-        # ====================================================
-        # FORECAST
-        # ====================================================
-
-        forecast_df = forecast_latest(
-            features,
-            models,
-            min_confidence
-        )
-
-        if forecast_df.empty:
-            st.warning(
-                "No valid forecasts available."
-            )
-            return
-
-        st.subheader(f"{symbol} Intraday Predictions")
-
-        st.dataframe(
-            forecast_df.style.format({
-                "Confidence": "{:.1%}",
-                "P(DOWN)": "{:.1%}",
-                "P(SIDEWAYS)": "{:.1%}",
-                "P(UP)": "{:.1%}"
-            }),
-            hide_index=True,
-            use_container_width=True
-        )
-
-        st.caption(
-            "UP/DOWN predictions below the "
-            "selected confidence threshold "
-            "are labeled WAIT. SIDEWAYS remains "
-            "a separate predicted class. "
-            "Probabilities are uncalibrated."
-        )
-
-        # ====================================================
-        # INDICATOR SNAPSHOT
-        # ====================================================
-
-        latest = features.iloc[-1]
-
-        st.subheader(f"{symbol} Current Indicator Alignment")
-
-        indicators = {
-            "Price": latest["close"],
-            "VWAP": latest["vwap"],
-            "EMA 9": latest["ema9"],
-            "EMA 20": latest["ema20"],
-            "RSI": latest["rsi"],
-            "MACD histogram": latest["macd_hist"],
-            "ADX": latest["adx"],
-            "Relative volume": latest["rvol"]
-        }
-
-        indicator_df = pd.DataFrame(
-            [
-                {"Indicator": k, "Value": v}
-                for k, v in indicators.items()
-            ]
-        )
-
-        st.dataframe(
-            indicator_df,
-            hide_index=True,
-            use_container_width=True
-        )
-
-    except requests.HTTPError as exc:
-        st.error(
-            f"Alpaca API error: {exc}"
-        )
-
+        st.dataframe(pd.DataFrame([levels]).T.rename(columns={0:'Price level'}), use_container_width=True)
+        day_boxes = boxes[boxes.index.date == latest_day]
+        if not day_boxes.empty:
+            latest = day_boxes.iloc[-1]
+            st.subheader('Box signal')
+            # Signal is a five-minute bar close; no guarantee it is still actionable.
+            signal = {1:'BULLISH BREAKOUT', -1:'BEARISH BREAKDOWN', 0:'WAIT'}[int(latest.signal)]
+            st.write(f'**{signal}** | Box high: {latest.box_high:.2f} | Box low: {latest.box_low:.2f} | '
+                     f'Volume ratio: {latest.vol_ratio:.2f} | EMA9: {latest.ema9:.2f} | EMA20: {latest.ema20:.2f}')
+            st.caption('Signal is descriptive, not a probability. Any entry must wait for the next candle and use a defined stop.')
+            events = day_boxes[day_boxes.signal != 0]
+            if not events.empty:
+                st.dataframe(events[['signal_time', 'signal', 'box_high', 'box_low', 'vol_ratio']].tail(20), use_container_width=True)
     except Exception as exc:
-        st.error(
-            f"Live refresh failed: {exc}"
-        )
+        st.error(f'Live data/chart error: {exc}')
 
 
 live_dashboard()
+
+st.divider()
+st.header('Historical box strategy backtest')
+st.caption('Tests completed 5-minute breakout signals, next-candle entries, ATR stops, fixed targets, one position at a time, and no overnight trades.')
+
+if run_test:
+    try:
+        if raw_uploaded is not None:
+            test_raw = raw_uploaded
+        elif key and secret_key:
+            today = dt.datetime.now(NY).date()
+            test_raw = merge_data(history(symbol, feed, key, secret_key, today.isoformat()),
+                                  live(symbol, feed, key, secret_key))
+        else:
+            raise ValueError('Upload a CSV or configure Alpaca credentials')
+        if len(set(test_raw.index.date)) < 10:
+            raise ValueError('At least 10 sessions recommended for backtesting')
+        st.session_state['test_raw'] = test_raw
+        # Compare the unfiltered box breakout with the trend+volume filtered version.
+        comparisons = []
+        for label, trend, volume in [
+            ('Box breakout only', False, False),
+            ('Box + trend', True, False),
+            ('Box + trend + volume', True, True)]:
+            b = make_boxes(test_raw, lookback, max_width, vol_mult, trend, volume)
+            t = backtest(b, hold_minutes//5, stop_atr, reward_risk, cost_bps)
+            summary = summarize(t)
+            comparisons.append({'Strategy': label, **summary})
+            if label == 'Box + trend + volume':
+                st.session_state['test_boxes'] = b
+                st.session_state['test_trades'] = t
+        st.session_state['test_comparison'] = pd.DataFrame(comparisons)
+    except Exception as exc:
+        st.error(f'Backtest failed: {exc}')
+
+if 'test_comparison' in st.session_state:
+    st.subheader('Strategy comparison')
+    table = st.session_state['test_comparison']
+    st.dataframe(table.style.format({'Win rate':'{:.1%}', 'Avg net bps':'{:.2f}',
+                                     'Total net bps':'{:.2f}', 'Profit factor':'{:.2f}'}),
+                 hide_index=True, use_container_width=True)
+    st.caption('Total net bps is the arithmetic sum of per-trade basis-point returns, not compounded portfolio performance. '
+               'The strategy may be unprofitable. IEX and SIP feeds can produce different signals.')
+    trades = st.session_state['test_trades']
+    if not trades.empty:
+        st.download_button('Download backtest trades CSV', trades.to_csv(index=False),
+                           file_name=f'{symbol}_box_trades.csv', mime='text/csv')
+        st.dataframe(trades.tail(50), use_container_width=True)
+    dates = sorted(set(st.session_state['test_raw'].index.date))
+    chosen = st.selectbox('Historical chart replay day', dates, index=len(dates)-1)
+    fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
+                                chosen, opening, windows[window])
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption('Chart shows completed 5-minute box levels and signals. Trendlines are visual aids, not entry rules.')
