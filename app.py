@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V12', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V13', layout='wide')
 
 
 def secret(*names, default=''):
@@ -431,54 +431,140 @@ def trend_duration_tracker(boxes, day=None):
     return d, events, snapshot
 
 
-def render_trend_duration_tracker(boxes, day=None):
-    st.subheader('Trend Duration Tracker')
-    timeline, events, state = trend_duration_tracker(boxes, day)
-    if state is None:
-        st.info('Waiting for completed five-minute candles.')
-        return
-    a, b, c, d = st.columns(4)
-    a.metric('Current 5m alignment', state['alignment'])
-    b.metric('Trend condition', state['status'])
-    c.metric('Confirmed box triggers', state['total_triggers'])
-    d.metric('Trend episodes', state['trend_episodes'])
-    if state['trigger_time'] is None:
-        st.info('No confirmed box breakout yet. Alignment can still be bullish, bearish or sideways.')
+def indicator_direction(ema9, ema20, close, vwap):
+    """Direction requires BOTH EMA and VWAP agreement; volume is not directional."""
+    vals = [ema9, ema20, close, vwap]
+    if not all(pd.notna(v) and np.isfinite(v) for v in vals):
+        return 'UNAVAILABLE'
+    if ema9 > ema20 and close > vwap:
+        return 'BULLISH'
+    if ema9 < ema20 and close < vwap:
+        return 'BEARISH'
+    return 'SIDEWAYS'
+
+
+def dual_timeframe_snapshot(raw, boxes, day=None):
+    """Use latest completed 1m candle and latest completed 5m candle, never partial 5m."""
+    if raw.empty or boxes.empty:
+        return None
+    if day is None:
+        day = raw.index[-1].date()
+    minute = raw[raw.index.date == day].copy()
+    five = boxes[boxes.index.date == day].copy()
+    if minute.empty or five.empty:
+        return None
+    indicators = minute_chart_indicators(minute)
+    last_minute = minute.iloc[-1]
+    last_indicators = indicators.iloc[-1]
+    last_five = five.iloc[-1]
+    minute_direction = indicator_direction(
+        last_indicators['ema9_1m'], last_indicators['ema20_1m'],
+        last_minute['close'], last_indicators['vwap_1m'])
+    five_direction = indicator_direction(
+        last_five['ema9'], last_five['ema20'],
+        last_five['close'], last_five['vwap'])
+    if minute_direction == five_direction and minute_direction in ('BULLISH', 'BEARISH'):
+        overall = minute_direction
+    elif minute_direction == 'UNAVAILABLE' or five_direction == 'UNAVAILABLE':
+        overall = 'UNAVAILABLE'
+    elif minute_direction == 'SIDEWAYS' and five_direction == 'SIDEWAYS':
+        overall = 'SIDEWAYS'
     else:
+        overall = 'MIXED'
+    return {
+        'one_minute': minute_direction,
+        'five_minute': five_direction,
+        'overall': overall,
+        'minute_asof': minute.index[-1] + pd.Timedelta(minutes=1),
+        'five_asof': last_five['signal_time'],
+        'one_ema9': float(last_indicators['ema9_1m']),
+        'one_ema20': float(last_indicators['ema20_1m']),
+        'one_close': float(last_minute['close']),
+        'one_vwap': float(last_indicators['vwap_1m']),
+        'five_ema9': float(last_five['ema9']),
+        'five_ema20': float(last_five['ema20']),
+        'five_close': float(last_five['close']),
+        'five_vwap': float(last_five['vwap']),
+        'volume_ratio': float(last_five['vol_ratio']) if pd.notna(last_five['vol_ratio']) else np.nan,
+        'volume_ok': bool(last_five['volume_ok']),
+    }
+
+
+def render_trend_duration_tracker(boxes, raw, day=None):
+    st.subheader('Trend Duration Tracker — 1m + 5m')
+    timeline, events, state = trend_duration_tracker(boxes, day)
+    dual = dual_timeframe_snapshot(raw, boxes, day)
+    if state is None or dual is None:
+        st.info('Waiting for completed one-minute and five-minute candles.')
+        return
+
+    # Do not call a trend BULLISH if the chart's 1m indicators are bearish.
+    a, b, c, d = st.columns(4)
+    a.metric('Combined alignment', dual['overall'])
+    b.metric('1-minute direction', dual['one_minute'])
+    c.metric('5-minute direction', dual['five_minute'])
+    d.metric('Confirmed box triggers', state['total_triggers'])
+
+    original = state['trigger_direction']
+    if original is None:
+        condition = 'NO BOX TRIGGER'
+        st.info('No confirmed breakout yet. Indicator direction alone is not a trade signal.')
+    elif dual['overall'] == original:
+        condition = 'CONTINUING' if state['status'] == 'CONTINUING' else 'RE-ALIGNED / NEW TRIGGER NEEDED'
+    elif dual['one_minute'] != original and dual['five_minute'] == original:
+        condition = 'WEAKENING — 1m AGAINST 5m'
+    elif dual['one_minute'] == dual['five_minute'] and dual['overall'] in ('BULLISH', 'BEARISH') and dual['overall'] != original:
+        condition = 'REVERSING — BOTH TIMEFRAMES'
+    else:
+        condition = 'MIXED / SIDEWAYS'
+
+    st.markdown(f'**Trend condition:** {condition}')
+    if dual['overall'] == 'MIXED':
+        st.warning('1-minute and 5-minute indicators disagree or are neutral. Do not interpret this as a fully confirmed bullish or bearish trend.')
+    if state['trigger_time'] is not None:
         st.write(
-            f"**Latest trigger:** {state['trigger_direction']} at "
+            f"**Latest box trigger:** {original} at "
             f"{state['trigger_time'].strftime('%I:%M %p ET')} | "
-            f"**Elapsed:** {state['minutes_since_trigger']} min | "
-            f"**Initial continuous alignment:** {state['last_completed_alignment_minutes']} min"
+            f"**Time since trigger:** {state['minutes_since_trigger']} min | "
+            f"**Initial 5m alignment:** {state['last_completed_alignment_minutes']} min"
         )
     st.caption(
-        'Trend alignment uses completed 5-minute EMA9 vs EMA20 and close vs VWAP, '
-        'matching the breakout strategy. CONTINUING means both still agree with the latest trigger. '
-        'WEAKENING means mixed/neutral alignment; REVERSING means both indicate the opposite direction. '
-        'A new confirmed trigger is required to start a new episode after alignment is lost. '
-        'Durations still active at the end of available data are censored, not completed trends.'
+        '1m values match the chart. 5m values match the breakout/backtest strategy. '
+        'The two clocks may differ by up to five minutes. Volume is a separate breakout filter, not a trend direction vote.'
     )
-    checks = pd.DataFrame([
-        {'Indicator': 'EMA 9 vs EMA 20', 'Bullish': state['ema9'] > state['ema20'],
-         'Bearish': state['ema9'] < state['ema20']},
-        {'Indicator': '5m close vs VWAP', 'Bullish': state['close'] > state['vwap'],
-         'Bearish': state['close'] < state['vwap']},
-        {'Indicator': 'Volume >= configured threshold',
-         'Bullish': bool(timeline['volume_ok'].iloc[-1]),
-         'Bearish': bool(timeline['volume_ok'].iloc[-1])},
-    ])
-    st.dataframe(checks, hide_index=True, use_container_width=True)
+
+    rows = []
+    for timeframe, prefix, direction in [
+        ('1 minute', 'one', dual['one_minute']),
+        ('5 minutes', 'five', dual['five_minute']),
+    ]:
+        ema9, ema20 = dual[f'{prefix}_ema9'], dual[f'{prefix}_ema20']
+        close, vwap = dual[f'{prefix}_close'], dual[f'{prefix}_vwap']
+        rows.append({
+            'Timeframe': timeframe,
+            'EMA 9': round(ema9, 3), 'EMA 20': round(ema20, 3),
+            'EMA direction': 'BULLISH' if ema9 > ema20 else ('BEARISH' if ema9 < ema20 else 'NEUTRAL'),
+            'Close': round(close, 3), 'VWAP': round(vwap, 3),
+            'VWAP direction': 'BULLISH' if close > vwap else ('BEARISH' if close < vwap else 'NEUTRAL'),
+            'Overall': direction,
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.caption(
+        f"1m completed: {dual['minute_asof'].strftime('%I:%M %p ET')} | "
+        f"5m completed: {dual['five_asof'].strftime('%I:%M %p ET')} | "
+        f"5m relative volume: {dual['volume_ratio']:.2f}x | "
+        f"Volume filter: {'PASS' if dual['volume_ok'] else 'FAIL'}"
+    )
     if not events.empty:
-        st.markdown('**Confirmed trigger episodes and trend persistence**')
+        st.markdown('**Confirmed breakout episodes (5-minute strategy)**')
         visible = events.rename(columns={
             'trigger_et': 'Trigger time (ET)', 'direction': 'Trigger',
-            'first_loss_et': 'First alignment loss (ET)',
-            'aligned_minutes': 'Continuous aligned minutes',
-            'outcome': 'Outcome', 'repeat_triggers': 'Repeated signals during episode',
+            'first_loss_et': 'First 5m alignment loss (ET)',
+            'aligned_minutes': 'Continuous 5m aligned minutes',
+            'outcome': '5m outcome', 'repeat_triggers': 'Repeated triggers',
         })
         st.dataframe(visible.tail(25), hide_index=True, use_container_width=True)
-    st.caption(f"As of {state['asof_et'].strftime('%Y-%m-%d %I:%M %p ET')}. "
-               'Indicator persistence is not the same as realized trade returns.')
+    st.caption('Trend alignment and duration are descriptive; neither measures realized trading profitability.')
 
 def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12, show_developing_boxes=False):
     # Calculate the indicators on ALL available 1m candles for the day,
@@ -608,7 +694,7 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V12 | Box Theory & Trend Duration')
+st.title('Stock Movement V13 | Dual-Timeframe Trend Tracker')
 st.caption('Research only. LIVE dotted box updates each completed 1m candle (display only); confirmed 5m prior-box rules and backtests remain unchanged. No orders are placed.')
 
 with st.sidebar:
@@ -687,7 +773,7 @@ def live_dashboard():
             st.warning('Data is stale or market is closed. Do not treat this as a live entry.')
         st.plotly_chart(fig, use_container_width=True)
         st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
-        render_trend_duration_tracker(boxes, latest_day)
+        render_trend_duration_tracker(boxes, raw, latest_day)
         day_boxes = boxes[boxes.index.date == latest_day]
         if not day_boxes.empty:
             latest = day_boxes.iloc[-1]
@@ -772,7 +858,7 @@ if 'test_comparison' in st.session_state:
     fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
                                 chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes)
     st.plotly_chart(fig, use_container_width=True)
-    render_trend_duration_tracker(st.session_state['test_boxes'], chosen)
+    render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
     st.caption('Backtest and confirmed signals use prior 5m boxes. LIVE 1m rolling box is display-only and can differ from the confirmed 5m box. ET signal times mark 5m candle close.')
     st.subheader('Historical breakout audit')
     audit = breakout_audit(st.session_state['test_boxes'], chosen)
