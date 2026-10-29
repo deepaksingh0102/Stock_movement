@@ -296,8 +296,34 @@ def breakout_audit(boxes, day=None):
     return a.loc[a.side != 'INSIDE', cols].reset_index(drop=True)
 
 
+def minute_chart_indicators(raw):
+    """Plot-only 1-minute EMA/VWAP. Independent of the 5m signal model.
+
+    Compute before chart-window slicing, reset at each session open, and
+    never use a future candle. VWAP uses typical-price approximation.
+    """
+    if raw.empty:
+        return pd.DataFrame(index=raw.index,
+                            columns=['ema9_1m', 'ema20_1m', 'vwap_1m'])
+    parts = []
+    for _, session in raw.groupby(raw.index.date):
+        s = session[['high', 'low', 'close', 'volume']].copy()
+        s['ema9_1m'] = s['close'].ewm(span=9, adjust=False).mean()
+        s['ema20_1m'] = s['close'].ewm(span=20, adjust=False).mean()
+        typical = (s['high'] + s['low'] + s['close']) / 3.0
+        cumulative_volume = s['volume'].cumsum().replace(0, np.nan)
+        s['vwap_1m'] = (typical * s['volume']).cumsum() / cumulative_volume
+        parts.append(s[['ema9_1m', 'ema20_1m', 'vwap_1m']])
+    return pd.concat(parts).sort_index()
+
+
 def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both"):
+    # Calculate the indicators on ALL available 1m candles for the day,
+    # then slice the display window. This avoids restarting the EMAs when
+    # switching from Since market open to 5/15/60 minutes.
     d = raw[raw.index.date == day].copy()
+    minute_indicators = minute_chart_indicators(d)
+    d = d.join(minute_indicators)
     b = boxes[boxes.index.date == day].copy()
     if visible_bars:
         d = d.tail(visible_bars)
@@ -324,16 +350,24 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
                                      hovertemplate=(
                                          '%{x}<br>Prior ' + name + ': %{y:.3f}' +
                                          '<br>5m close: %{customdata:.3f}<extra></extra>')))
-        for name, color in [('ema9', '#eab308'), ('ema20', '#2563eb'),
-                            ('vwap', '#8b5cf6')]:
-            fig.add_trace(go.Scatter(x=shown.signal_time, y=shown[name], mode='lines',
-                                     name=name.upper(), line=dict(color=color, width=1.5)))
         for side, color, marker, label in [(1, 'green', 'triangle-up', 'Confirmed UP'),
                                            (-1, 'red', 'triangle-down', 'Confirmed DOWN')]:
             ev = shown[shown.signal == side]
             fig.add_trace(go.Scatter(x=ev.signal_time, y=ev.close,
                                      mode='markers', name=label,
                                      marker=dict(color=color, size=12, symbol=marker)))
+    # Chart indicators use 1m candles, unlike the box strategy's 5m
+    # EMA/VWAP confirmation. Draw them even before the first box exists.
+    for field, color, label in [
+        ('ema9_1m', '#eab308', 'EMA9 (1m)'),
+        ('ema20_1m', '#2563eb', 'EMA20 (1m)'),
+        ('vwap_1m', '#8b5cf6', 'VWAP (1m)'),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=d.index, y=d[field], mode='lines', name=label,
+            line=dict(color=color, width=1.7),
+            hovertemplate='%{x}<br>' + label + ': $%{y:.3f}<extra></extra>'
+        ))
     levels = levels_for_day(raw, day, opening_minutes)
     palette = {'PDH': '#16a34a', 'PDL': '#dc2626', 'PDC': '#64748b',
                'OR High': '#0891b2', 'OR Low': '#ea580c'}
@@ -365,8 +399,8 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V7 | Darvas Box Breakout')
-st.caption('Research and paper-testing only. No orders are placed. WAIT means no confirmed setup.')
+st.title('Stock Movement V8 | Darvas Box Breakout')
+st.caption('Research and paper-testing only. No orders are placed. Chart EMA9/EMA20/VWAP use 1-minute bars; box confirmation and backtests use 5-minute bars.')
 
 with st.sidebar:
     symbol = st.text_input('U.S. stock / ETF symbol', 'QQQ').strip().upper()
@@ -437,7 +471,7 @@ def live_dashboard():
             st.info('NYSE regular session CLOSED — refresh paused. '
                     'Last cached chart is displayed. Reload after the next market open.')
         st.metric('Last completed minute close', f'${raw.close.iloc[-1]:.2f}')
-        st.caption(f'Latest candle: {raw.index[-1]} | Feed: {feed.upper()} | 1-minute bars; box signals use completed 5-minute candles')
+        st.caption(f'Latest candle: {raw.index[-1]} | Feed: {feed.upper()} | 1-minute chart indicators; box signals use completed 5-minute candles')
         if (dt.datetime.now(NY) - raw.index[-1]).total_seconds() > 300:
             st.warning('Data is stale or market is closed. Do not treat this as a live entry.')
         st.plotly_chart(fig, use_container_width=True)
