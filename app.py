@@ -1,4 +1,4 @@
-"""Stock Movement V7: market-aware refresh and close-price line; shared box rules."""
+"""Stock Movement V9: developing box display; unchanged confirmed box trading rules."""
 import datetime as dt
 import re
 from zoneinfo import ZoneInfo
@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V7', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V9', layout='wide')
 
 
 def secret(*names, default=''):
@@ -176,6 +176,12 @@ def make_boxes(raw, lookback=12, max_width_pct=0.9, vol_multiplier=1.2,
     for _, d in x.groupby(x.index.date):
         d = d.copy()
         n = lookback
+        # Display-only provisional box, based solely on completed 5m candles.
+        # No trade may use these levels before the full lookback exists.
+        d['completed_box_candles'] = np.arange(1, len(d) + 1)
+        d['developing_high'] = d.high.rolling(n, min_periods=1).max()
+        d['developing_low'] = d.low.rolling(n, min_periods=1).min()
+        d['developing'] = d['completed_box_candles'] < n
         d['box_high'] = d.high.rolling(n, min_periods=n).max().shift(1)
         d['box_low'] = d.low.rolling(n, min_periods=n).min().shift(1)
         d['box_width_pct'] = (d.box_high - d.box_low) / d.close * 100
@@ -341,6 +347,26 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
         # Plot the prior-box boundaries at that timestamp, not at candle start.
         shown = b[(b.signal_time >= d.index.min()) &
                   (b.signal_time <= d.index[-1] + pd.Timedelta(minutes=1))]
+        # Developing box is informational only. At 09:35 ET, the first
+        # completed 09:30-09:35 candle supplies the first provisional levels.
+        # Keep it separate from prior-box boundaries used for trade signals.
+        developing = shown[shown['developing']]
+        for field, color, label in [
+            ('developing_high', '#f5b041', 'Developing BOX_HIGH (not tradable)'),
+            ('developing_low', '#76d7c4', 'Developing BOX_LOW (not tradable)')
+        ]:
+            fig.add_trace(go.Scatter(
+                x=developing.signal_time, y=developing[field],
+                mode='lines+markers', name=label,
+                line=dict(color=color, width=2, dash='dot', shape='hv'),
+                marker=dict(size=5),
+                customdata=developing['completed_box_candles'],
+                hovertemplate='%{x}<br>' + label + ': %{y:.3f}' +
+                              '<br>Completed candles: %{customdata}<extra></extra>'
+            ))
+        # Confirmed prior box stays identical to the backtest reference.
+        # First eligible signal is the close of candle N+1, so the prior
+        # reference becomes visible then. No artificial early signals.
         for name, color in [('box_high', '#e67e22'), ('box_low', '#16a085')]:
             fig.add_trace(go.Scatter(x=shown.signal_time, y=shown[name],
                                      mode='lines+markers', name=name.upper() + ' (prior)',
@@ -399,8 +425,8 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V8 | Darvas Box Breakout')
-st.caption('Research and paper-testing only. No orders are placed. Chart EMA9/EMA20/VWAP use 1-minute bars; box confirmation and backtests use 5-minute bars.')
+st.title('Stock Movement V9 | Darvas Box Breakout')
+st.caption('Research and paper-testing only. No orders are placed. Chart EMA9/EMA20/VWAP use 1-minute bars. Dotted developing box starts at first completed 5m candle; only confirmed prior-box levels can generate trades.')
 
 with st.sidebar:
     symbol = st.text_input('U.S. stock / ETF symbol', 'QQQ').strip().upper()
@@ -417,7 +443,7 @@ with st.sidebar:
                '2 hours': 120, '4 hours': 240, 'Since market open': None}
     st.divider()
     st.subheader('Box strategy')
-    lookback = st.slider('Box lookback (5m candles)', 6, 24, 12)
+    lookback = st.slider('Box lookback (5m candles)', 3, 24, 12)
     max_width = st.slider('Maximum box width (%)', 0.2, 2.0, 0.9, 0.1)
     vol_mult = st.slider('Breakout relative volume', 1.0, 3.0, 1.2, 0.1)
     hold_minutes = st.selectbox('Maximum holding time', [5, 15, 30, 60], index=2)
@@ -484,7 +510,9 @@ def live_dashboard():
             signal = {1:'BULLISH BREAKOUT', -1:'BEARISH BREAKDOWN', 0:'WAIT'}[int(latest.signal)]
             st.write(f'**{signal}** | Box high: {latest.box_high:.2f} | Box low: {latest.box_low:.2f} | '
                      f'Volume ratio: {latest.vol_ratio:.2f} | EMA9: {latest.ema9:.2f} | EMA20: {latest.ema20:.2f}')
-            st.caption('Signal is descriptive, not a probability. Any entry must wait for the next candle and use a defined stop.')
+            if pd.isna(latest.box_high):
+                st.info(f'Developing box: {int(latest.completed_box_candles)}/{lookback} completed 5-minute candles. Not eligible for breakout signals yet.')
+            st.caption('Signal is descriptive, not a probability. Dotted developing levels never trigger trades; only the prior completed box is used for confirmation. Any entry must wait for the next candle and use a defined stop.')
             audit = breakout_audit(boxes, latest_day)
             st.subheader('Breakout audit — previous box vs 5m close')
             st.caption('All times are Eastern. Price crossing is shown even when trend/volume filters reject the trade.')
@@ -558,7 +586,7 @@ if 'test_comparison' in st.session_state:
     fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
                                 chosen, opening, windows[window], chart_display)
     st.plotly_chart(fig, use_container_width=True)
-    st.caption('Chart and backtest use the same make_boxes() output and prior-box values. ET labels mark candle CLOSE time. Trendlines are visual aids only.')
+    st.caption('Chart and backtest use the same make_boxes() output and prior-box values. Dotted developing lines are display-only. ET labels mark candle CLOSE time. Trendlines are visual aids only.')
     st.subheader('Historical breakout audit')
     audit = breakout_audit(st.session_state['test_boxes'], chosen)
     if not audit.empty:
