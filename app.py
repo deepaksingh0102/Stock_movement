@@ -1,4 +1,4 @@
-"""Stock Movement V9: developing box display; unchanged confirmed box trading rules."""
+"""Stock Movement V11: distinct trading-box colors and optional provisional overlays."""
 import datetime as dt
 import re
 from zoneinfo import ZoneInfo
@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V9', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V11', layout='wide')
 
 
 def secret(*names, default=''):
@@ -343,7 +343,7 @@ def live_minute_box(raw, day, lookback):
     return out
 
 
-def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12):
+def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12, show_developing_boxes=False):
     # Calculate the indicators on ALL available 1m candles for the day,
     # then slice the display window. This avoids restarting the EMAs when
     # switching from Since market open to 5/15/60 minutes.
@@ -363,17 +363,17 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
             x=d.index, y=d.close, mode='lines', name='1m close price',
             line=dict(color='#16a34a', width=2.3),
             hovertemplate='Time: %{x}<br>Close: $%{y:.3f}<extra></extra>'))
-    # Current display-only box follows completed 1-minute candles.
-    # A separate prior 5m box below remains the ONLY trading reference.
-    for field, color, label in [
-        ('live_box_high', '#d97706', 'LIVE BOX_HIGH (1m, display only)'),
-        ('live_box_low', '#0d9488', 'LIVE BOX_LOW (1m, display only)'),
-    ]:
-        fig.add_trace(go.Scatter(
-            x=d.index, y=d[field], mode='lines', name=label,
-            line=dict(color=color, width=2.5, dash='dot', shape='hv'),
-            hovertemplate='%{x}<br>' + label + ': %{y:.3f}<extra></extra>'
-        ))
+    # Optional, low-contrast reference overlays. Not used for trading.
+    if show_developing_boxes:
+        for field, color, label in [
+            ('live_box_high', '#9CA3AF', 'LIVE BOX_HIGH (1m, display only)'),
+            ('live_box_low', '#CBD5E1', 'LIVE BOX_LOW (1m, display only)'),
+        ]:
+            fig.add_trace(go.Scatter(
+                x=d.index, y=d[field], mode='lines', name=label,
+                line=dict(color=color, width=1.5, dash='dot', shape='hv'),
+                hovertemplate='%{x}<br>' + label + ': $%{y:.3f}<extra></extra>'
+            ))
     # Extend the last known prior 5m box to the latest 1m candle on screen.
     # No new five-minute signal is inferred from this extension.
     if not b.empty and not d.empty:
@@ -384,23 +384,25 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
         # Developing box is informational only. At 09:35 ET, the first
         # completed 09:30-09:35 candle supplies the first provisional levels.
         # Keep it separate from prior-box boundaries used for trade signals.
-        developing = shown[shown['developing']]
-        for field, color, label in [
-            ('developing_high', '#f5b041', 'Developing BOX_HIGH (not tradable)'),
-            ('developing_low', '#76d7c4', 'Developing BOX_LOW (not tradable)')
-        ]:
-            fig.add_trace(go.Scatter(
-                x=developing.signal_time, y=developing[field],
-                mode='lines+markers', name=label,
-                line=dict(color=color, width=2, dash='dot', shape='hv'),
-                marker=dict(size=5),
-                customdata=developing['completed_box_candles'],
-                hovertemplate='%{x}<br>' + label + ': %{y:.3f}' +
-                              '<br>Completed candles: %{customdata}<extra></extra>'
-            ))
+        if show_developing_boxes:
+            developing = shown[shown['developing']]
+            for field, color, label in [
+                ('developing_high', '#D1D5DB', 'Developing BOX_HIGH (not tradable)'),
+                ('developing_low', '#E5E7EB', 'Developing BOX_LOW (not tradable)')
+            ]:
+                fig.add_trace(go.Scatter(
+                    x=developing.signal_time, y=developing[field],
+                    mode='lines+markers', name=label,
+                    line=dict(color=color, width=1.5, dash='dot', shape='hv'),
+                    marker=dict(size=4),
+                    customdata=developing['completed_box_candles'],
+                    hovertemplate='%{x}<br>' + label + ': $%{y:.3f}' +
+                                  '<br>Completed candles: %{customdata}<extra></extra>'
+                ))
         # Draw prior-box levels through the most recent minute so the lines
         # do not appear to stop 1-5 minutes behind the live price.
         # This is a visual hold, NOT a new signal.
+        confirmed_events = shown[shown.signal != 0].copy()
         if not shown.empty and d.index[-1] > shown.signal_time.iloc[-1]:
             last_row = shown.iloc[-1].copy()
             last_row['signal_time'] = d.index[-1]
@@ -408,18 +410,21 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
         # Confirmed prior box stays identical to the backtest reference.
         # First eligible signal is the close of candle N+1, so the prior
         # reference becomes visible then. No artificial early signals.
-        for name, color in [('box_high', '#e67e22'), ('box_low', '#16a085')]:
+        for name, color, label in [
+            ('box_high', '#DC2626', 'BOX_HIGH (Trading)'),
+            ('box_low', '#2563EB', 'BOX_LOW (Trading)')
+        ]:
             fig.add_trace(go.Scatter(x=shown.signal_time, y=shown[name],
-                                     mode='lines+markers', name=name.upper() + ' (prior)',
-                                     line=dict(color=color, width=2, shape='hv'),
-                                     marker=dict(size=4),
+                                     mode='lines+markers', name=label,
+                                     line=dict(color=color, width=3.5, shape='hv'),
+                                     marker=dict(size=5, color=color),
                                      customdata=shown.close,
                                      hovertemplate=(
-                                         '%{x}<br>Prior ' + name + ': %{y:.3f}' +
+                                         '%{x}<br>' + label + ': $%{y:.3f}' +
                                          '<br>5m close: %{customdata:.3f}<extra></extra>')))
         for side, color, marker, label in [(1, 'green', 'triangle-up', 'Confirmed UP'),
                                            (-1, 'red', 'triangle-down', 'Confirmed DOWN')]:
-            ev = shown[shown.signal == side]
+            ev = confirmed_events[confirmed_events.signal == side]
             fig.add_trace(go.Scatter(x=ev.signal_time, y=ev.close,
                                      mode='markers', name=label,
                                      marker=dict(color=color, size=12, symbol=marker)))
@@ -466,7 +471,7 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V9 | Darvas Box Breakout')
+st.title('Stock Movement V11 | Darvas Box Breakout')
 st.caption('Research only. LIVE dotted box updates each completed 1m candle (display only); confirmed 5m prior-box rules and backtests remain unchanged. No orders are placed.')
 
 with st.sidebar:
@@ -477,6 +482,8 @@ with st.sidebar:
     feed = st.selectbox('Alpaca feed', ['iex', 'sip'],
                         index=1 if secret('ALPACA_FEED', default='iex') == 'sip' else 0)
     opening = st.selectbox('Opening range (minutes)', [5, 15, 30], index=1)
+    show_developing_boxes = st.checkbox('Show developing/live boxes', value=False,
+                                       help='Optional visual-only box lines. Red and blue trading boxes remain visible.')
     chart_display = st.selectbox('Chart display', ['Candlestick', 'Line', 'Both'], index=2)
     window = st.selectbox('Chart timeframe', ['5 minutes', '15 minutes', '1 hour',
                                               '2 hours', '4 hours', 'Since market open'], index=5)
@@ -530,7 +537,7 @@ def live_dashboard():
             return
         boxes = make_boxes(raw, lookback, max_width, vol_mult, True, True)
         latest_day = raw.index[-1].date()
-        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback)
+        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback, show_developing_boxes)
         st.subheader(f'{symbol} | Live chart')
         if is_regular_session_open():
             st.caption('NYSE regular session OPEN — refreshing every 30 seconds.')
@@ -542,7 +549,7 @@ def live_dashboard():
         if (dt.datetime.now(NY) - raw.index[-1]).total_seconds() > 300:
             st.warning('Data is stale or market is closed. Do not treat this as a live entry.')
         st.plotly_chart(fig, use_container_width=True)
-        st.caption('LIVE BOX_HIGH/LOW update from prior completed 1-minute candles. Confirmed 5m BOX_HIGH/LOW remain the trade and backtest reference.')
+        st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
         st.dataframe(pd.DataFrame([levels]).T.rename(columns={0:'Price level'}), use_container_width=True)
         day_boxes = boxes[boxes.index.date == latest_day]
         if not day_boxes.empty:
@@ -626,7 +633,7 @@ if 'test_comparison' in st.session_state:
     dates = sorted(set(st.session_state['test_raw'].index.date))
     chosen = st.selectbox('Historical chart replay day', dates, index=len(dates)-1)
     fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
-                                chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0])
+                                chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes)
     st.plotly_chart(fig, use_container_width=True)
     st.caption('Backtest and confirmed signals use prior 5m boxes. LIVE 1m rolling box is display-only and can differ from the confirmed 5m box. ET signal times mark 5m candle close.')
     st.subheader('Historical breakout audit')
