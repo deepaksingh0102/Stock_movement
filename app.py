@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V13', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V14', layout='wide')
 
 
 def secret(*names, default=''):
@@ -566,6 +566,111 @@ def render_trend_duration_tracker(boxes, raw, day=None):
         st.dataframe(visible.tail(25), hide_index=True, use_container_width=True)
     st.caption('Trend alignment and duration are descriptive; neither measures realized trading profitability.')
 
+def reversal_analysis(raw, boxes, day, reclaim_bars=3):
+    """Research-only reversal layer. No changes to backtest entry rules.
+
+    Breakout is a completed 5m CLOSE beyond the prior eligible box, regardless
+    of volume/trend confirmation. The original boundary is frozen at crossing.
+    Reclaim is recognized only on a later completed 5m candle, within the
+    specified window. No future observations are used at any signal time.
+    """
+    minute = raw[raw.index.date == day].copy()
+    five = boxes[boxes.index.date == day].copy()
+    if minute.empty or five.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    m = minute_chart_indicators(minute)
+    m['close'] = minute['close']
+    fast = minute['close'].ewm(span=12, adjust=False).mean()
+    slow = minute['close'].ewm(span=26, adjust=False).mean()
+    m['macd'] = fast - slow
+    m['macd_signal'] = m['macd'].ewm(span=9, adjust=False).mean()
+    m['histogram'] = m['macd'] - m['macd_signal']
+    m['hist_slope'] = m['histogram'].diff()
+    # A 3-bar slope is less sensitive to single-candle noise.
+    m['hist_slope_3'] = m['histogram'].diff(3)
+    m['momentum'] = np.select(
+        [(m.histogram > 0) & (m.hist_slope_3 > 0),
+         (m.histogram < 0) & (m.hist_slope_3 < 0),
+         (m.histogram < 0) & (m.hist_slope_3 > 0),
+         (m.histogram > 0) & (m.hist_slope_3 < 0)],
+        ['BULLISH ACCELERATING', 'BEARISH ACCELERATING',
+         'BEARISH WEAKENING', 'BULLISH WEAKENING'], default='NEUTRAL')
+    f = five.copy()
+    fast5 = f.close.ewm(span=12, adjust=False).mean()
+    slow5 = f.close.ewm(span=26, adjust=False).mean()
+    f['macd'] = fast5 - slow5
+    f['macd_signal'] = f.macd.ewm(span=9, adjust=False).mean()
+    f['histogram'] = f.macd - f.macd_signal
+    f['hist_slope'] = f.histogram.diff()
+    f['momentum'] = np.select(
+        [(f.histogram < 0) & (f.hist_slope > 0),
+         (f.histogram > 0) & (f.hist_slope < 0),
+         (f.histogram > 0) & (f.hist_slope > 0),
+         (f.histogram < 0) & (f.hist_slope < 0)],
+        ['BEARISH WEAKENING', 'BULLISH WEAKENING',
+         'BULLISH ACCELERATING', 'BEARISH ACCELERATING'], default='NEUTRAL')
+    events = []
+    active = None
+    for i, (_, bar) in enumerate(f.iterrows()):
+        # First evaluate a previously opened candidate; never reclaim on same bar.
+        if active is not None:
+            elapsed = i - active['start_i']
+            reclaimed = ((active['direction'] == 'DOWN' and bar.close > active['boundary'])
+                         or (active['direction'] == 'UP' and bar.close < active['boundary']))
+            if reclaimed and elapsed <= reclaim_bars:
+                events.append({'time_et': bar.signal_time, 'event': 'FAILED BREAKDOWN' if active['direction']=='DOWN' else 'FAILED BREAKOUT',
+                               'original_break_et': active['break_time'], 'frozen_level': active['boundary'],
+                               'close': float(bar.close), 'bars_to_reclaim': elapsed})
+                active = None
+            elif elapsed >= reclaim_bars:
+                active = None
+        # Only one candidate at a time; new break uses strictly previous box.
+        if active is None and pd.notna(bar.box_high) and bar.box_width_pct <= max_width_for_reversal:
+            direction = 'UP' if bar.close > bar.box_high else ('DOWN' if bar.close < bar.box_low else None)
+            if direction:
+                active = {'direction': direction,
+                          'boundary': float(bar.box_high if direction=='UP' else bar.box_low),
+                          'break_time': bar.signal_time, 'start_i': i}
+    return m, f, pd.DataFrame(events)
+
+
+# This threshold is assigned from the current sidebar before charts are drawn.
+max_width_for_reversal = 0.9
+
+
+def render_reversal_panel(raw, boxes, day, reclaim_bars=3):
+    st.subheader('Momentum & Failed-Breakout Monitor (experimental)')
+    m, f, events = reversal_analysis(raw, boxes, day, reclaim_bars)
+    if m.empty or f.empty:
+        st.info('Waiting for completed candles to assess momentum and failed breakouts.')
+        return
+    last_m, last_f = m.iloc[-1], f.iloc[-1]
+    latest_event = events.iloc[-1] if not events.empty else None
+    a, b, c = st.columns(3)
+    a.metric('1m MACD momentum', str(last_m.momentum))
+    b.metric('5m MACD momentum', str(last_f.momentum))
+    c.metric('Failed breakouts detected', len(events))
+    if latest_event is not None:
+        st.warning(f"Latest: {latest_event['event']} at {latest_event['time_et'].strftime('%I:%M %p ET')} "
+                   f"| Frozen level ${latest_event['frozen_level']:.2f} "
+                   f"| Reclaimed after {int(latest_event['bars_to_reclaim']) * 5} minutes")
+    if last_f.ema9 < last_f.ema20 and last_f.close < last_f.vwap and last_m.hist_slope_3 > 0:
+        st.info('Bearish EMA/VWAP alignment, but 1m MACD histogram is improving: possible bearish weakening, not a confirmed reversal.')
+    elif last_f.ema9 > last_f.ema20 and last_f.close > last_f.vwap and last_m.hist_slope_3 < 0:
+        st.info('Bullish EMA/VWAP alignment, but 1m MACD histogram is weakening: possible bullish weakening, not a confirmed reversal.')
+    st.caption('MACD slope and box reclaims are diagnostic warnings only. The original 5m box signals and backtest rules are unchanged. Reclaim events require a later completed 5m close across the frozen breakout boundary.')
+    hist = go.Figure()
+    hist.add_trace(go.Bar(x=m.index, y=m.histogram,
+        marker_color=np.where(m.histogram >= 0, '#16a34a', '#dc2626'), name='1m MACD histogram'))
+    hist.add_trace(go.Scatter(x=m.index, y=m.hist_slope_3, name='Histogram change (3m)',
+                              line=dict(color='#7c3aed', width=1.6)))
+    hist.update_layout(height=260, title='MACD histogram and 3-minute change',
+                       xaxis_title='Eastern Time', margin=dict(t=40,b=30))
+    st.plotly_chart(hist, use_container_width=True)
+    if not events.empty:
+        st.dataframe(events.tail(20), hide_index=True, use_container_width=True)
+
+
 def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12, show_developing_boxes=False):
     # Calculate the indicators on ALL available 1m candles for the day,
     # then slice the display window. This avoids restarting the EMAs when
@@ -578,6 +683,16 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     if visible_bars:
         d = d.tail(visible_bars)
     fig = go.Figure()
+    _, _, failed_events = reversal_analysis(raw, boxes, day, reclaim_window)
+    if not failed_events.empty:
+        for event_name, color, marker in [
+            ('FAILED BREAKDOWN', '#f97316', 'triangle-up'),
+            ('FAILED BREAKOUT', '#a855f7', 'triangle-down')]:
+            ev = failed_events[failed_events.event == event_name]
+            fig.add_trace(go.Scatter(x=ev.time_et, y=ev.close, mode='markers',
+                name=event_name, marker=dict(size=13, color=color, symbol=marker,
+                line=dict(color='white', width=1)),
+                hovertemplate=event_name + '<br>%{x}<br>Close: $%{y:.2f}<extra></extra>'))
     if chart_display in ('Candlestick', 'Both'):
         fig.add_trace(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low,
                                      close=d.close, name='Price'))
@@ -694,8 +809,8 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V13 | Dual-Timeframe Trend Tracker')
-st.caption('Research only. LIVE dotted box updates each completed 1m candle (display only); confirmed 5m prior-box rules and backtests remain unchanged. No orders are placed.')
+st.title('Stock Movement V14 | Box Theory & Reversal Detection')
+st.caption('Research only. Failed-breakout and MACD reversal warnings are experimental; original five-minute trading/backtest signals remain unchanged. No orders are placed.')
 
 with st.sidebar:
     symbol = st.text_input('U.S. stock / ETF symbol', 'QQQ').strip().upper()
@@ -717,6 +832,7 @@ with st.sidebar:
     lookback = st.slider('Box lookback (5m candles)', 3, 24, 12)
     max_width = st.slider('Maximum box width (%)', 0.2, 2.0, 0.9, 0.1)
     vol_mult = st.slider('Breakout relative volume', 1.0, 3.0, 1.2, 0.1)
+    reclaim_window = st.slider('Failed-breakout reclaim window (5m bars)', 1, 6, 3)
     hold_minutes = st.selectbox('Maximum holding time', [5, 15, 30, 60], index=2)
     stop_atr = st.slider('Stop distance (ATR multiplier)', 0.5, 3.0, 1.2, 0.1)
     reward_risk = st.slider('Profit target (reward/risk)', 0.5, 4.0, 1.5, 0.1)
@@ -726,6 +842,8 @@ with st.sidebar:
     naive_tz = st.selectbox('Timezone for CSV timestamps without offset',
                             ['America/New_York', 'UTC'], index=0)
     run_test = st.button('Run historical backtest', type='primary')
+
+max_width_for_reversal = max_width
 
 key = secret('ALPACA_API_KEY', 'APCA_API_KEY_ID', 'ALPACA_KEY')
 secret_key = secret('ALPACA_SECRET_KEY', 'APCA_API_SECRET_KEY', 'ALPACA_SECRET')
@@ -774,6 +892,7 @@ def live_dashboard():
         st.plotly_chart(fig, use_container_width=True)
         st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
         render_trend_duration_tracker(boxes, raw, latest_day)
+        render_reversal_panel(raw, boxes, latest_day, reclaim_window)
         day_boxes = boxes[boxes.index.date == latest_day]
         if not day_boxes.empty:
             latest = day_boxes.iloc[-1]
@@ -859,6 +978,7 @@ if 'test_comparison' in st.session_state:
                                 chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes)
     st.plotly_chart(fig, use_container_width=True)
     render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
+    render_reversal_panel(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window)
     st.caption('Backtest and confirmed signals use prior 5m boxes. LIVE 1m rolling box is display-only and can differ from the confirmed 5m box. ET signal times mark 5m candle close.')
     st.subheader('Historical breakout audit')
     audit = breakout_audit(st.session_state['test_boxes'], chosen)
