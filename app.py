@@ -323,13 +323,34 @@ def minute_chart_indicators(raw):
     return pd.concat(parts).sort_index()
 
 
-def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both"):
+def live_minute_box(raw, day, lookback):
+    """Display-only 1-minute rolling box using PRIOR completed 1m bars.
+
+    The window is lookback * 5 minutes, matching the selected box duration.
+    It updates with each completed minute, never using that minute's OHLC
+    in its own boundary. It does NOT affect 5m backtest/trading signals.
+    """
+    d = raw[raw.index.date == day].copy()
+    if d.empty:
+        return pd.DataFrame(index=d.index)
+    n = int(lookback) * 5
+    # Minimum 1 prior minute allows an early provisional display.
+    # Only the 5m prior box from make_boxes() is tradable.
+    out = pd.DataFrame(index=d.index)
+    out['live_box_high'] = d.high.shift(1).rolling(n, min_periods=1).max()
+    out['live_box_low'] = d.low.shift(1).rolling(n, min_periods=1).min()
+    out['minutes_ready'] = np.minimum(np.arange(len(d)), n)
+    return out
+
+
+def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12):
     # Calculate the indicators on ALL available 1m candles for the day,
     # then slice the display window. This avoids restarting the EMAs when
     # switching from Since market open to 5/15/60 minutes.
     d = raw[raw.index.date == day].copy()
     minute_indicators = minute_chart_indicators(d)
     d = d.join(minute_indicators)
+    d = d.join(live_minute_box(raw, day, box_lookback))
     b = boxes[boxes.index.date == day].copy()
     if visible_bars:
         d = d.tail(visible_bars)
@@ -342,6 +363,19 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
             x=d.index, y=d.close, mode='lines', name='1m close price',
             line=dict(color='#16a34a', width=2.3),
             hovertemplate='Time: %{x}<br>Close: $%{y:.3f}<extra></extra>'))
+    # Current display-only box follows completed 1-minute candles.
+    # A separate prior 5m box below remains the ONLY trading reference.
+    for field, color, label in [
+        ('live_box_high', '#d97706', 'LIVE BOX_HIGH (1m, display only)'),
+        ('live_box_low', '#0d9488', 'LIVE BOX_LOW (1m, display only)'),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=d.index, y=d[field], mode='lines', name=label,
+            line=dict(color=color, width=2.5, dash='dot', shape='hv'),
+            hovertemplate='%{x}<br>' + label + ': %{y:.3f}<extra></extra>'
+        ))
+    # Extend the last known prior 5m box to the latest 1m candle on screen.
+    # No new five-minute signal is inferred from this extension.
     if not b.empty and not d.empty:
         # All box values and signals become known at the five-minute candle CLOSE.
         # Plot the prior-box boundaries at that timestamp, not at candle start.
@@ -364,6 +398,13 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
                 hovertemplate='%{x}<br>' + label + ': %{y:.3f}' +
                               '<br>Completed candles: %{customdata}<extra></extra>'
             ))
+        # Draw prior-box levels through the most recent minute so the lines
+        # do not appear to stop 1-5 minutes behind the live price.
+        # This is a visual hold, NOT a new signal.
+        if not shown.empty and d.index[-1] > shown.signal_time.iloc[-1]:
+            last_row = shown.iloc[-1].copy()
+            last_row['signal_time'] = d.index[-1]
+            shown = pd.concat([shown, pd.DataFrame([last_row])], ignore_index=True)
         # Confirmed prior box stays identical to the backtest reference.
         # First eligible signal is the close of candle N+1, so the prior
         # reference becomes visible then. No artificial early signals.
@@ -426,7 +467,7 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
 
 
 st.title('Stock Movement V9 | Darvas Box Breakout')
-st.caption('Research and paper-testing only. No orders are placed. Chart EMA9/EMA20/VWAP use 1-minute bars. Dotted developing box starts at first completed 5m candle; only confirmed prior-box levels can generate trades.')
+st.caption('Research only. LIVE dotted box updates each completed 1m candle (display only); confirmed 5m prior-box rules and backtests remain unchanged. No orders are placed.')
 
 with st.sidebar:
     symbol = st.text_input('U.S. stock / ETF symbol', 'QQQ').strip().upper()
@@ -489,7 +530,7 @@ def live_dashboard():
             return
         boxes = make_boxes(raw, lookback, max_width, vol_mult, True, True)
         latest_day = raw.index[-1].date()
-        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display)
+        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback)
         st.subheader(f'{symbol} | Live chart')
         if is_regular_session_open():
             st.caption('NYSE regular session OPEN — refreshing every 30 seconds.')
@@ -501,6 +542,7 @@ def live_dashboard():
         if (dt.datetime.now(NY) - raw.index[-1]).total_seconds() > 300:
             st.warning('Data is stale or market is closed. Do not treat this as a live entry.')
         st.plotly_chart(fig, use_container_width=True)
+        st.caption('LIVE BOX_HIGH/LOW update from prior completed 1-minute candles. Confirmed 5m BOX_HIGH/LOW remain the trade and backtest reference.')
         st.dataframe(pd.DataFrame([levels]).T.rename(columns={0:'Price level'}), use_container_width=True)
         day_boxes = boxes[boxes.index.date == latest_day]
         if not day_boxes.empty:
@@ -584,9 +626,9 @@ if 'test_comparison' in st.session_state:
     dates = sorted(set(st.session_state['test_raw'].index.date))
     chosen = st.selectbox('Historical chart replay day', dates, index=len(dates)-1)
     fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
-                                chosen, opening, windows[window], chart_display)
+                                chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0])
     st.plotly_chart(fig, use_container_width=True)
-    st.caption('Chart and backtest use the same make_boxes() output and prior-box values. Dotted developing lines are display-only. ET labels mark candle CLOSE time. Trendlines are visual aids only.')
+    st.caption('Backtest and confirmed signals use prior 5m boxes. LIVE 1m rolling box is display-only and can differ from the confirmed 5m box. ET signal times mark 5m candle close.')
     st.subheader('Historical breakout audit')
     audit = breakout_audit(st.session_state['test_boxes'], chosen)
     if not audit.empty:
