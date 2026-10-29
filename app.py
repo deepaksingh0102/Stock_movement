@@ -1,4 +1,4 @@
-"""Stock Movement V5: rule-based Darvas-style box breakout research dashboard."""
+"""Stock Movement V7: market-aware refresh and close-price line; shared box rules."""
 import datetime as dt
 import re
 from zoneinfo import ZoneInfo
@@ -8,10 +8,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V5', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V7', layout='wide')
 
 
 def secret(*names, default=''):
@@ -86,6 +87,41 @@ def live(symbol, feed, key, secret_key):
     end = dt.datetime.fromtimestamp(int(now.timestamp() // 30) * 30, UTC)
     start = end - dt.timedelta(days=4)
     return alpaca_bars(symbol, start.isoformat(), end.isoformat(), feed, key, secret_key)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def market_hours(day_iso):
+    """NYSE regular session schedule, including holidays and early closes."""
+    schedule = mcal.get_calendar('NYSE').schedule(
+        start_date=day_iso, end_date=day_iso)
+    if schedule.empty:
+        return None
+    return (schedule.iloc[0]['market_open'].to_pydatetime(),
+            schedule.iloc[0]['market_close'].to_pydatetime())
+
+
+def is_regular_session_open():
+    now = dt.datetime.now(UTC)
+    schedule = market_hours(now.astimezone(NY).date().isoformat())
+    return schedule is not None and schedule[0] <= now < schedule[1]
+
+
+def load_market_data(symbol, feed, key, secret_key):
+    """Fetch live during session; reuse last snapshot when closed.
+
+    On a first visit outside market hours, fetch once to populate the chart.
+    The cache is isolated per symbol, feed, and New York calendar day.
+    """
+    today = dt.datetime.now(NY).date()
+    cache_id = f'market_snapshot:{symbol}:{feed}:{today.isoformat()}'
+    if not is_regular_session_open() and cache_id in st.session_state:
+        return st.session_state[cache_id].copy()
+
+    old = history(symbol, feed, key, secret_key, today.isoformat())
+    recent = live(symbol, feed, key, secret_key)
+    raw = merge_data(old, recent)
+    st.session_state[cache_id] = raw.copy()
+    return raw
 
 
 def merge_data(a, b):
@@ -260,14 +296,20 @@ def breakout_audit(boxes, day=None):
     return a.loc[a.side != 'INSIDE', cols].reset_index(drop=True)
 
 
-def chart_for_day(raw, boxes, day, opening_minutes, visible_bars):
+def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both"):
     d = raw[raw.index.date == day].copy()
     b = boxes[boxes.index.date == day].copy()
     if visible_bars:
         d = d.tail(visible_bars)
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low,
-                                 close=d.close, name='Price'))
+    if chart_display in ('Candlestick', 'Both'):
+        fig.add_trace(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low,
+                                     close=d.close, name='Price'))
+    if chart_display in ('Line', 'Both'):
+        fig.add_trace(go.Scatter(
+            x=d.index, y=d.close, mode='lines', name='1m close price',
+            line=dict(color='#16a34a', width=2.3),
+            hovertemplate='Time: %{x}<br>Close: $%{y:.3f}<extra></extra>'))
     if not b.empty and not d.empty:
         # All box values and signals become known at the five-minute candle CLOSE.
         # Plot the prior-box boundaries at that timestamp, not at candle start.
@@ -323,7 +365,7 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars):
     return fig, levels
 
 
-st.title('Stock Movement V5 | Darvas Box Breakout')
+st.title('Stock Movement V7 | Darvas Box Breakout')
 st.caption('Research and paper-testing only. No orders are placed. WAIT means no confirmed setup.')
 
 with st.sidebar:
@@ -334,6 +376,7 @@ with st.sidebar:
     feed = st.selectbox('Alpaca feed', ['iex', 'sip'],
                         index=1 if secret('ALPACA_FEED', default='iex') == 'sip' else 0)
     opening = st.selectbox('Opening range (minutes)', [5, 15, 30], index=1)
+    chart_display = st.selectbox('Chart display', ['Candlestick', 'Line', 'Both'], index=2)
     window = st.selectbox('Chart timeframe', ['5 minutes', '15 minutes', '1 hour',
                                               '2 hours', '4 hours', 'Since market open'], index=5)
     windows = {'5 minutes': 5, '15 minutes': 15, '1 hour': 60,
@@ -367,23 +410,32 @@ else:
     raw_uploaded = None
 
 
-@st.fragment(run_every='30s')
+# The timer is enabled only when this page is rendered during market hours.
+# At the first post-close tick we rerun the app to remove the timer.
+@st.fragment(run_every='30s' if is_regular_session_open() else None)
 def live_dashboard():
     if not key or not secret_key:
         st.info('Configure Alpaca keys in Streamlit Secrets to enable live charts.')
         return
     try:
-        today = dt.datetime.now(NY).date()
-        old = history(symbol, feed, key, secret_key, today.isoformat())
-        recent = live(symbol, feed, key, secret_key)
-        raw = merge_data(old, recent)
+        if not is_regular_session_open() and st.session_state.get('was_market_open', False):
+            # Rebuild page once with run_every=None; stop all scheduled reruns.
+            st.session_state['was_market_open'] = False
+            st.rerun(scope='app')
+        st.session_state['was_market_open'] = is_regular_session_open()
+        raw = load_market_data(symbol, feed, key, secret_key)
         if raw.empty:
             st.warning('No recent market data')
             return
         boxes = make_boxes(raw, lookback, max_width, vol_mult, True, True)
         latest_day = raw.index[-1].date()
-        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window])
-        st.subheader(f'{symbol} | Live chart (refresh every 30 seconds)')
+        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display)
+        st.subheader(f'{symbol} | Live chart')
+        if is_regular_session_open():
+            st.caption('NYSE regular session OPEN — refreshing every 30 seconds.')
+        else:
+            st.info('NYSE regular session CLOSED — refresh paused. '
+                    'Last cached chart is displayed. Reload after the next market open.')
         st.metric('Last completed minute close', f'${raw.close.iloc[-1]:.2f}')
         st.caption(f'Latest candle: {raw.index[-1]} | Feed: {feed.upper()} | 1-minute bars; box signals use completed 5-minute candles')
         if (dt.datetime.now(NY) - raw.index[-1]).total_seconds() > 300:
@@ -470,7 +522,7 @@ if 'test_comparison' in st.session_state:
     dates = sorted(set(st.session_state['test_raw'].index.date))
     chosen = st.selectbox('Historical chart replay day', dates, index=len(dates)-1)
     fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
-                                chosen, opening, windows[window])
+                                chosen, opening, windows[window], chart_display)
     st.plotly_chart(fig, use_container_width=True)
     st.caption('Chart and backtest use the same make_boxes() output and prior-box values. ET labels mark candle CLOSE time. Trendlines are visual aids only.')
     st.subheader('Historical breakout audit')
