@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V16', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V16.1', layout='wide')
 
 
 def secret(*names, default=''):
@@ -1286,10 +1286,23 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V16 | Box Theory & Detection Lab')
+st.title('Stock Movement V16.1 | Box Theory & Detection Lab')
 st.caption('Research only. V15 frozen-boundary detection, MACD slope/acceleration and time-of-day RVOL are diagnostic only; original trading/backtest signals remain unchanged. No orders are placed.')
 
+# Pausing disables the fragment timer itself, not just Alpaca requests.
+# A normal Streamlit widget rerun rebuilds the fragment with run_every=None.
+if 'pause_live_refresh' not in st.session_state:
+    st.session_state['pause_live_refresh'] = False
+
 with st.sidebar:
+    st.subheader('Live refresh')
+    pause_live_refresh = st.toggle(
+        'Pause automatic refresh', key='pause_live_refresh',
+        help='Freeze the displayed live chart and detection results. Resume to fetch new data every 30 seconds while the market is open.')
+    if pause_live_refresh:
+        st.info('PAUSED - existing snapshot remains visible. No automatic updates.')
+    else:
+        st.caption('Automatic refresh: every 30 seconds during regular market hours.')
     symbol = st.text_input('U.S. stock / ETF symbol', 'QQQ').strip().upper()
     if not re.fullmatch(r'[A-Z][A-Z0-9.-]{0,9}', symbol):
         st.error('Invalid ticker symbol')
@@ -1340,7 +1353,7 @@ else:
 
 # The timer is enabled only when this page is rendered during market hours.
 # At the first post-close tick we rerun the app to remove the timer.
-@st.fragment(run_every='30s' if is_regular_session_open() else None)
+@st.fragment(run_every='30s' if (is_regular_session_open() and not pause_live_refresh) else None)
 def live_dashboard():
     if not key or not secret_key:
         st.info('Configure Alpaca keys in Streamlit Secrets to enable live charts.')
@@ -1351,7 +1364,18 @@ def live_dashboard():
             st.session_state['was_market_open'] = False
             st.rerun(scope='app')
         st.session_state['was_market_open'] = is_regular_session_open()
-        raw = load_market_data(symbol, feed, key, secret_key)
+        # Store the latest complete source snapshot per symbol/feed. While paused,
+        # never call Alpaca; re-render from the saved data instead.
+        snapshot_key = f'paused_live_snapshot:{symbol}:{feed}'
+        if pause_live_refresh:
+            raw = st.session_state.get(snapshot_key)
+            if raw is None:
+                st.info('No snapshot for this symbol/feed yet. Resume refresh once to load it, then pause.')
+                return
+            raw = raw.copy()
+        else:
+            raw = load_market_data(symbol, feed, key, secret_key)
+            st.session_state[snapshot_key] = raw.copy()
         if raw.empty:
             st.warning('No recent market data')
             return
@@ -1359,10 +1383,13 @@ def live_dashboard():
         latest_day = raw.index[-1].date()
         fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback, show_developing_boxes)
         st.subheader(f'{symbol} | Live chart')
-        if is_regular_session_open():
-            st.caption('NYSE regular session OPEN — refreshing every 30 seconds.')
+        if pause_live_refresh:
+            st.warning('DISPLAY PAUSED - showing the saved snapshot. Signals are not live. '
+                       'Turn off Pause automatic refresh to resume 30-second updates.')
+        elif is_regular_session_open():
+            st.caption('NYSE regular session OPEN - refreshing every 30 seconds.')
         else:
-            st.info('NYSE regular session CLOSED — refresh paused. '
+            st.info('NYSE regular session CLOSED - refresh paused. '
                     'Last cached chart is displayed. Reload after the next market open.')
         st.metric('Last completed minute close', f'${raw.close.iloc[-1]:.2f}')
         st.caption(f'Latest candle: {raw.index[-1]} | Feed: {feed.upper()} | 1-minute chart indicators; box signals use completed 5-minute candles')
