@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V16.1', layout='wide')
+st.set_page_config(page_title='Stock Movement | Simple Dashboard V16.2', layout='wide', initial_sidebar_state='expanded')
 
 
 def secret(*names, default=''):
@@ -1057,7 +1057,7 @@ def three_stage_detection(raw, boxes, candidates, atr_fraction=0.25):
 
 
 def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_sessions):
-    st.subheader('V15 | Breakout & Reversal Detection Lab')
+    st.subheader('Breakout Detection Timeline')
     b, candidates, events = detection_engine(raw, boxes, reclaim_bars,
                                              sustain_bars, min_tod_sessions)
     if b.empty:
@@ -1286,54 +1286,55 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V16.1 | Box Theory & Detection Lab')
-st.caption('Research only. V15 frozen-boundary detection, MACD slope/acceleration and time-of-day RVOL are diagnostic only; original trading/backtest signals remain unchanged. No orders are placed.')
+st.title('Stock Movement | V16.2')
+st.caption('Simple live view with optional in-depth detection research. No orders are placed.')
 
-# Pausing disables the fragment timer itself, not just Alpaca requests.
-# A normal Streamlit widget rerun rebuilds the fragment with run_every=None.
 if 'pause_live_refresh' not in st.session_state:
     st.session_state['pause_live_refresh'] = False
 
 with st.sidebar:
-    st.subheader('Live refresh')
-    pause_live_refresh = st.toggle(
-        'Pause automatic refresh', key='pause_live_refresh',
-        help='Freeze the displayed live chart and detection results. Resume to fetch new data every 30 seconds while the market is open.')
-    if pause_live_refresh:
-        st.info('PAUSED - existing snapshot remains visible. No automatic updates.')
-    else:
-        st.caption('Automatic refresh: every 30 seconds during regular market hours.')
-    symbol = st.text_input('U.S. stock / ETF symbol', 'QQQ').strip().upper()
+    st.subheader('Stock & live updates')
+    symbol = st.text_input('Stock / ETF symbol', 'QQQ').strip().upper()
     if not re.fullmatch(r'[A-Z][A-Z0-9.-]{0,9}', symbol):
         st.error('Invalid ticker symbol')
         st.stop()
+    pause_live_refresh = st.toggle('Pause automatic refresh', key='pause_live_refresh',
+        help='Freeze the displayed data and stop automatic refresh until resumed.')
+    st.caption('PAUSED - saved data' if pause_live_refresh else 'Every 30 seconds while market is open')
     feed = st.selectbox('Alpaca feed', ['iex', 'sip'],
-                        index=1 if secret('ALPACA_FEED', default='iex') == 'sip' else 0)
-    opening = st.selectbox('Opening range (minutes)', [5, 15, 30], index=1)
-    show_developing_boxes = st.checkbox('Show developing/live boxes', value=False,
-                                       help='Optional visual-only box lines. Red and blue trading boxes remain visible.')
-    chart_display = st.selectbox('Chart display', ['Candlestick', 'Line', 'Both'], index=2)
-    window = st.selectbox('Chart timeframe', ['5 minutes', '15 minutes', '1 hour',
-                                              '2 hours', '4 hours', 'Since market open'], index=5)
+        index=1 if secret('ALPACA_FEED', default='iex') == 'sip' else 0)
+    page = st.radio('View', ['Live Overview', 'Detection Lab', 'Historical Backtest'],
+                    index=0, help='Only the selected view is rendered to reduce clutter and scrolling.')
+    with st.expander('Chart options', expanded=False):
+        opening = st.selectbox('Opening range (minutes)', [5, 15, 30], index=1)
+        show_developing_boxes = st.checkbox('Show developing/live boxes', value=False)
+        chart_display = st.selectbox('Chart display', ['Candlestick', 'Line', 'Both'], index=2)
+        window = st.selectbox('Chart timeframe', ['5 minutes', '15 minutes', '1 hour',
+            '2 hours', '4 hours', 'Since market open'], index=5)
     windows = {'5 minutes': 5, '15 minutes': 15, '1 hour': 60,
                '2 hours': 120, '4 hours': 240, 'Since market open': None}
-    st.divider()
-    st.subheader('Box strategy')
-    lookback = st.slider('Box lookback (5m candles)', 3, 24, 12)
-    max_width = st.slider('Maximum box width (%)', 0.2, 2.0, 0.9, 0.1)
-    vol_mult = st.slider('Breakout relative volume', 1.0, 3.0, 1.2, 0.1)
-    reclaim_window = st.slider('Failed-breakout reclaim window (5m bars)', 1, 6, 3)
-    sustain_window = st.slider('Sustained breakout confirmation (5m bars)', 1, 3, 2)
-    min_tod_sessions = st.slider('Minimum prior sessions for time-of-day RVOL', 2, 15, 5)
-    hold_minutes = st.selectbox('Maximum holding time', [5, 15, 30, 60], index=2)
-    stop_atr = st.slider('Stop distance (ATR multiplier)', 0.5, 3.0, 1.2, 0.1)
-    reward_risk = st.slider('Profit target (reward/risk)', 0.5, 4.0, 1.5, 0.1)
-    cost_bps = st.number_input('Estimated round-trip cost (bps)', 0.0, 30.0, 2.0, 0.5)
-    st.divider()
-    uploaded = st.file_uploader('Historical 1-minute CSV (optional)', type=['csv'])
-    naive_tz = st.selectbox('Timezone for CSV timestamps without offset',
-                            ['America/New_York', 'UTC'], index=0)
-    run_test = st.button('Run historical backtest', type='primary')
+    with st.expander('Box & detection settings', expanded=False):
+        lookback = st.slider('Box lookback (5m candles)', 3, 24, 12)
+        max_width = st.slider('Maximum box width (%)', 0.2, 2.0, 0.9, 0.1)
+        vol_mult = st.slider('Breakout relative volume', 1.0, 3.0, 1.2, 0.1)
+        reclaim_window = st.slider('Reclaim window (5m bars)', 1, 6, 3)
+        sustain_window = st.slider('Sustain confirmation (5m bars)', 1, 3, 2)
+        min_tod_sessions = st.slider('Prior sessions for time-of-day RVOL', 2, 15, 5)
+    with st.expander('Backtest settings', expanded=False):
+        hold_minutes = st.selectbox('Maximum holding time', [5, 15, 30, 60], index=2)
+        stop_atr = st.slider('Stop distance (ATR multiplier)', 0.5, 3.0, 1.2, 0.1)
+        reward_risk = st.slider('Profit target (reward/risk)', 0.5, 4.0, 1.5, 0.1)
+        cost_bps = st.number_input('Estimated round-trip cost (bps)', 0.0, 30.0, 2.0, 0.5)
+    if page == 'Historical Backtest':
+        st.divider()
+        uploaded = st.file_uploader('Historical 1-minute CSV (optional)', type=['csv'])
+        naive_tz = st.selectbox('Timezone for CSV timestamps without offset',
+                                ['America/New_York', 'UTC'], index=0)
+        run_test = st.button('Run historical backtest', type='primary')
+    else:
+        uploaded = None
+        naive_tz = 'America/New_York'
+        run_test = False
 
 max_width_for_reversal = max_width
 
@@ -1351,82 +1352,101 @@ else:
     raw_uploaded = None
 
 
-# The timer is enabled only when this page is rendered during market hours.
-# At the first post-close tick we rerun the app to remove the timer.
-@st.fragment(run_every='30s' if (is_regular_session_open() and not pause_live_refresh) else None)
+# Render live panels only when requested. The historical backtest has no timer.
+@st.fragment(run_every='30s' if (page != 'Historical Backtest' and
+             is_regular_session_open() and not pause_live_refresh) else None)
 def live_dashboard():
     if not key or not secret_key:
         st.info('Configure Alpaca keys in Streamlit Secrets to enable live charts.')
         return
     try:
         if not is_regular_session_open() and st.session_state.get('was_market_open', False):
-            # Rebuild page once with run_every=None; stop all scheduled reruns.
             st.session_state['was_market_open'] = False
             st.rerun(scope='app')
         st.session_state['was_market_open'] = is_regular_session_open()
-        # Store the latest complete source snapshot per symbol/feed. While paused,
-        # never call Alpaca; re-render from the saved data instead.
         snapshot_key = f'paused_live_snapshot:{symbol}:{feed}'
         if pause_live_refresh:
             raw = st.session_state.get(snapshot_key)
             if raw is None:
-                st.info('No snapshot for this symbol/feed yet. Resume refresh once to load it, then pause.')
+                st.info('No saved snapshot yet. Resume once to load data, then pause.')
                 return
             raw = raw.copy()
         else:
             raw = load_market_data(symbol, feed, key, secret_key)
             st.session_state[snapshot_key] = raw.copy()
         if raw.empty:
-            st.warning('No recent market data')
+            st.warning('No recent market data.')
             return
         boxes = make_boxes(raw, lookback, max_width, vol_mult, True, True)
-        latest_day = raw.index[-1].date()
-        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback, show_developing_boxes)
-        st.subheader(f'{symbol} | Live chart')
+        day = raw.index[-1].date()
+        d = boxes[boxes.index.date == day]
+        last = d.iloc[-1] if not d.empty else None
+        dual = dual_timeframe_snapshot(raw, boxes, day)
+        state_label = dual['overall'] if dual else 'UNAVAILABLE'
+        signal_label = ({1:'BULLISH BREAKOUT', -1:'BEARISH BREAKDOWN', 0:'NO CONFIRMED BREAKOUT'}
+                        [int(last.signal)] if last is not None else 'NOT READY')
+        is_open = is_regular_session_open()
         if pause_live_refresh:
-            st.warning('DISPLAY PAUSED - showing the saved snapshot. Signals are not live. '
-                       'Turn off Pause automatic refresh to resume 30-second updates.')
-        elif is_regular_session_open():
-            st.caption('NYSE regular session OPEN - refreshing every 30 seconds.')
-        else:
-            st.info('NYSE regular session CLOSED - refresh paused. '
-                    'Last cached chart is displayed. Reload after the next market open.')
-        st.metric('Last completed minute close', f'${raw.close.iloc[-1]:.2f}')
-        st.caption(f'Latest candle: {raw.index[-1]} | Feed: {feed.upper()} | 1-minute chart indicators; box signals use completed 5-minute candles')
-        if (dt.datetime.now(NY) - raw.index[-1]).total_seconds() > 300:
-            st.warning('Data is stale or market is closed. Do not treat this as a live entry.')
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
-        render_trend_duration_tracker(boxes, raw, latest_day)
-        render_reversal_panel(raw, boxes, latest_day, reclaim_window)
-        render_detection_lab(raw, boxes, latest_day, reclaim_window, sustain_window, min_tod_sessions)
-        day_boxes = boxes[boxes.index.date == latest_day]
-        if not day_boxes.empty:
-            latest = day_boxes.iloc[-1]
-            st.subheader('Box signal')
-            # Signal is a five-minute bar close; no guarantee it is still actionable.
-            signal = {1:'BULLISH BREAKOUT', -1:'BEARISH BREAKDOWN', 0:'WAIT'}[int(latest.signal)]
-            st.write(f'**{signal}** | Box high: {latest.box_high:.2f} | Box low: {latest.box_low:.2f} | '
-                     f'Volume ratio: {latest.vol_ratio:.2f} | EMA9: {latest.ema9:.2f} | EMA20: {latest.ema20:.2f}')
-            if pd.isna(latest.box_high):
-                st.info(f'Developing box: {int(latest.completed_box_candles)}/{lookback} completed 5-minute candles. Not eligible for breakout signals yet.')
-            st.caption('Signal is descriptive, not a probability. Dotted developing levels never trigger trades; only the prior completed box is used for confirmation. Any entry must wait for the next candle and use a defined stop.')
-            audit = breakout_audit(boxes, latest_day)
-            st.subheader('Breakout audit — previous box vs 5m close')
-            st.caption('All times are Eastern. Price crossing is shown even when trend/volume filters reject the trade.')
-            if not audit.empty:
-                st.dataframe(audit.tail(30), hide_index=True, use_container_width=True)
+            st.info('Display paused - reviewing saved snapshot. Resume to update every 30 seconds.')
+        elif not is_open:
+            st.info('Market closed - live refresh stopped. Last available session shown.')
+        age = (dt.datetime.now(NY) - raw.index[-1]).total_seconds()
+        if is_open and not pause_live_refresh and age > 300:
+            st.warning('Latest data is delayed. Do not interpret this as a current trading signal.')
+        a, b, c, dcol = st.columns(4)
+        a.metric('Last price', f'${raw.close.iloc[-1]:.2f}')
+        b.metric('Trend (1m + 5m)', state_label)
+        c.metric('Box confirmation', signal_label)
+        dcol.metric('5m volume', f'{last.vol_ratio:.2f}x' if last is not None and pd.notna(last.vol_ratio) else 'N/A')
+        st.caption(f'Last candle: {raw.index[-1].strftime("%b %d, %I:%M %p ET")} | '
+                   f'Feed: {feed.upper()} | Chart uses 1m indicators; confirmation uses completed 5m bars.')
+        if page == 'Live Overview':
+            fig, _ = chart_for_day(raw, boxes, day, opening, windows[window],
+                                   chart_display, lookback, show_developing_boxes)
+            fig.update_layout(height=480, margin=dict(l=10,r=10,t=45,b=20),
+                              legend=dict(orientation='h', y=-0.18))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption('Red = confirmed box high; blue = confirmed box low. '
+                       'An indicator trend is not a confirmed box breakout.')
+            with st.expander('Why is the trend classified this way?', expanded=False):
+                if dual:
+                    st.write(f"**1-minute:** {dual['one_minute']} | **5-minute:** {dual['five_minute']}")
+                    st.write(f"1m EMA9 {dual['one_ema9']:.3f}, EMA20 {dual['one_ema20']:.3f}, "
+                             f"close {dual['one_close']:.3f}, VWAP {dual['one_vwap']:.3f}")
+                    st.write(f"5m EMA9 {dual['five_ema9']:.3f}, EMA20 {dual['five_ema20']:.3f}, "
+                             f"close {dual['five_close']:.3f}, VWAP {dual['five_vwap']:.3f}")
+            with st.expander('Latest box levels & signal conditions', expanded=False):
+                if last is not None:
+                    st.write(f"**BOX_HIGH:** {last.box_high:.3f} | **BOX_LOW:** {last.box_low:.3f}")
+                    st.write(f"**Volume pass:** {'Yes' if last.volume_ok else 'No'} | "
+                             f"**Box width:** {last.box_width_pct:.2f}%")
+            st.caption('For breakout timelines, MACD warnings, and validation, select Detection Lab in the sidebar.')
+        elif page == 'Detection Lab':
+            st.caption('Choose one research panel at a time to keep the display compact.')
+            panel = st.selectbox('Research panel', [
+                'Three-stage breakout timeline', 'MACD & failed breakouts',
+                'Trend duration & indicators', 'Five-minute breakout audit'])
+            if panel == 'Three-stage breakout timeline':
+                render_detection_lab(raw, boxes, day, reclaim_window,
+                                     sustain_window, min_tod_sessions)
+            elif panel == 'MACD & failed breakouts':
+                render_reversal_panel(raw, boxes, day, reclaim_window)
+            elif panel == 'Trend duration & indicators':
+                render_trend_duration_tracker(boxes, raw, day)
             else:
-                st.info('No price crossings of the previous completed box yet.')
+                audit = breakout_audit(boxes, day)
+                if not audit.empty:
+                    st.dataframe(audit.tail(40), hide_index=True, use_container_width=True)
+                else:
+                    st.info('No completed box crossings for this session.')
     except Exception as exc:
         st.error(f'Live data/chart error: {exc}')
 
-
-live_dashboard()
-
-st.divider()
-st.header('Historical box strategy backtest')
-st.caption('Tests completed 5-minute breakout signals, next-candle entries, ATR stops, fixed targets, one position at a time, and no overnight trades.')
+if page != 'Historical Backtest':
+    live_dashboard()
+else:
+    st.header('Historical Box Theory Backtest')
+    st.caption('Manual testing only. Results use the existing, unchanged trade rules.')
 
 if run_test:
     try:
@@ -1484,9 +1504,14 @@ if 'test_comparison' in st.session_state:
     fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
                                 chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes)
     st.plotly_chart(fig, use_container_width=True)
-    render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
-    render_reversal_panel(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window)
-    render_detection_lab(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window, sustain_window, min_tod_sessions)
+    replay_panel = st.selectbox('Historical research detail', [
+        'None', 'Trend duration', 'MACD & failed breakouts', 'Detection audit & validation'])
+    if replay_panel == 'Trend duration':
+        render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
+    elif replay_panel == 'MACD & failed breakouts':
+        render_reversal_panel(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window)
+    elif replay_panel == 'Detection audit & validation':
+        render_detection_lab(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window, sustain_window, min_tod_sessions)
     st.caption('Backtest and confirmed signals use prior 5m boxes. LIVE 1m rolling box is display-only and can differ from the confirmed 5m box. ET signal times mark 5m candle close.')
     st.subheader('Historical breakout audit')
     audit = breakout_audit(st.session_state['test_boxes'], chosen)
