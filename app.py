@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V15', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V15.1', layout='wide')
 
 
 def secret(*names, default=''):
@@ -629,7 +629,7 @@ def reversal_analysis(raw, boxes, day, reclaim_bars=3):
             direction = 'UP' if bar.close > bar.box_high else ('DOWN' if bar.close < bar.box_low else None)
             if direction:
                 active = {'direction': direction,
-                          'boundary': float(bar.box_high if direction=='UP' else bar.box_low),
+                          'frozen_boundary': float(bar.box_high if direction=='UP' else bar.box_low),
                           'break_time': bar.signal_time, 'start_i': i}
     return m, f, pd.DataFrame(events)
 
