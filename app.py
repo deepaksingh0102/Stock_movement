@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V15.1', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V16', layout='wide')
 
 
 def secret(*names, default=''):
@@ -861,6 +861,201 @@ def detection_metrics(candidates):
     return pd.DataFrame(rows, columns=['Metric','Value'])
 
 
+def three_stage_detection(raw, boxes, candidates, atr_fraction=0.25):
+    """Detection-only audit, no forward data in signal generation.
+
+    A 1m close is stamped at its candle END. Its reference is the box known
+    at the START of its containing five-minute interval. Never use the box
+    produced by the five-minute interval being evaluated.
+    """
+    columns = ['time_et', 'event', 'candidate_id', 'direction',
+               'frozen_boundary', 'close', 'detail']
+    if raw.empty or boxes.empty:
+        return pd.DataFrame(columns=columns), pd.DataFrame(), pd.DataFrame()
+    minute = raw.sort_index()
+    b = boxes.sort_index().copy()
+    for _, g in b.groupby(b.index.date):
+        fast = g.close.ewm(span=12, adjust=False).mean()
+        slow = g.close.ewm(span=26, adjust=False).mean()
+        macd = fast - slow
+        hist = macd - macd.ewm(span=9, adjust=False).mean()
+        b.loc[g.index, 'macd_slope'] = hist.diff()
+        b.loc[g.index, 'macd_acceleration'] = hist.diff().diff()
+    stage_events = []
+    first_cross = {}
+    # All eligible 1-minute crossings are visible, including ones that fail
+    # to survive to a five-minute closing breakout.
+    for day, f in b.groupby(b.index.date):
+        m = minute[minute.index.date == day]
+        if m.empty:
+            continue
+        for five_start, bar in f.iterrows():
+            if not (pd.notna(bar.box_high) and pd.notna(bar.box_low)):
+                continue
+            # Use only frozen boundaries, not the future 5m closing price,
+            # when deciding whether to emit an early 1m diagnostic.
+            midpoint = (float(bar.box_high) + float(bar.box_low)) / 2
+            if midpoint <= 0 or (float(bar.box_high) - float(bar.box_low)) / midpoint * 100 > max_width_for_reversal:
+                continue
+            window = m[(m.index >= five_start) &
+                       (m.index < five_start + pd.Timedelta(minutes=5))]
+            for side, bound in [('UP', float(bar.box_high)),
+                                ('DOWN', float(bar.box_low))]:
+                crossed = window[window.close > bound] if side == 'UP' else window[window.close < bound]
+                if crossed.empty:
+                    continue
+                # This is the first completed 1m close across this *frozen*
+                # boundary for this particular 5m decision interval.
+                first = crossed.iloc[0]
+                when = crossed.index[0] + pd.Timedelta(minutes=1)
+                key = (five_start, side)
+                first_cross[key] = when
+                stage_events.append(dict(time_et=when, event='FIRST 1M CROSS',
+                    candidate_id=None, direction=side, frozen_boundary=bound,
+                    close=float(first.close), detail='Early crossing; not a confirmed five-minute signal'))
+
+    # Early live diagnostic for the currently INCOMPLETE five-minute interval.
+    # No five-minute confirmation is inferred; only already completed 1m bars
+    # and the previous completed five-minute bars determine its boundary.
+    for day, g in b.groupby(b.index.date):
+        minute_day = minute[minute.index.date == day]
+        if g.empty or minute_day.empty:
+            continue
+        last_complete_end = g.signal_time.iloc[-1]
+        partial = minute_day[minute_day.index >= last_complete_end]
+        if partial.empty:
+            continue
+        first_eligible = g[g.box_high.notna()]
+        if first_eligible.empty:
+            continue
+        lookback_n = max(1, int(first_eligible.completed_box_candles.iloc[0]) - 1)
+        if len(g) < lookback_n:
+            continue
+        prior = g.tail(lookback_n)
+        upper, lower = float(prior.high.max()), float(prior.low.min())
+        midpoint = (upper + lower) / 2
+        if midpoint <= 0 or (upper - lower) / midpoint * 100 > max_width_for_reversal:
+            continue
+        for side, bound in [('UP', upper), ('DOWN', lower)]:
+            crossing = partial[partial.close > bound] if side == 'UP' else partial[partial.close < bound]
+            if crossing.empty:
+                continue
+            when = crossing.index[0] + pd.Timedelta(minutes=1)
+            stage_events.append(dict(time_et=when, event='FIRST 1M CROSS (PENDING 5M)',
+                candidate_id=None, direction=side, frozen_boundary=bound,
+                close=float(crossing.close.iloc[0]),
+                detail='Current incomplete five-minute candle; not a confirmed breakout'))
+
+    if candidates.empty:
+        stage = pd.DataFrame(stage_events, columns=columns)
+        return stage.sort_values('time_et').reset_index(drop=True), pd.DataFrame(), pd.DataFrame()
+
+    result = candidates.copy()
+    fields = ['first_1m_cross_et', 'five_min_close_et', 'fully_confirmed_et',
+              'first_macd_warning_et', 'macd_warning_before_reclaim',
+              'macd_warning_lead_minutes', 'first_alignment_loss_et',
+              'alignment_persistence_minutes', 'alignment_censored',
+              'continuation_5m', 'continuation_15m',
+              'continuation_5m_evaluable', 'continuation_15m_evaluable']
+    for field in fields:
+        result[field] = pd.NA
+    for i, c in result.iterrows():
+        day = pd.Timestamp(c.crossed_at_et).date()
+        g = b[b.index.date == day]
+        side = c.direction
+        sign = 1 if side == 'UP' else -1
+        t = pd.Timestamp(c.crossed_at_et)
+        five_start = t - pd.Timedelta(minutes=5)
+        one = first_cross.get((five_start, side), pd.NaT)
+        result.at[i, 'first_1m_cross_et'] = one
+        result.at[i, 'five_min_close_et'] = t
+        if bool(c.confirmed):
+            result.at[i, 'fully_confirmed_et'] = t
+        stage_events.append(dict(time_et=t, event='FIVE-MINUTE CLOSE BREAK',
+            candidate_id=c.id, direction=side,
+            frozen_boundary=float(c.frozen_boundary), close=float(c.crossing_close),
+            detail='Five-minute close beyond prior completed box'))
+        if bool(c.confirmed):
+            stage_events.append(dict(time_et=t, event='FULLY CONFIRMED',
+                candidate_id=c.id, direction=side,
+                frozen_boundary=float(c.frozen_boundary), close=float(c.crossing_close),
+                detail='Original EMA/VWAP, volume, candle and box-width rules passed'))
+        # MACD warning must be observable AFTER the crossing and BEFORE
+        # the first later completed 5m close reclaiming the frozen boundary.
+        after = g[(g.signal_time > t)]
+        resolution = c.resolved_at_et if pd.notna(c.resolved_at_et) else pd.NaT
+        until = after[after.signal_time < resolution] if pd.notna(resolution) else after
+        opposite_warning = ((until.macd_slope > 0) & (until.macd_acceleration > 0)) if side == 'DOWN' else ((until.macd_slope < 0) & (until.macd_acceleration < 0))
+        warned = until[opposite_warning.fillna(False)]
+        if not warned.empty:
+            wtime = warned.iloc[0].signal_time
+            result.at[i, 'first_macd_warning_et'] = wtime
+            if c.outcome == 'FAILED' and pd.notna(resolution):
+                result.at[i, 'macd_warning_before_reclaim'] = True
+                result.at[i, 'macd_warning_lead_minutes'] = int((resolution - wtime).total_seconds() / 60)
+            stage_events.append(dict(time_et=wtime, event='MACD REVERSAL WARNING',
+                candidate_id=c.id, direction=side,
+                frozen_boundary=float(c.frozen_boundary),
+                close=float(warned.iloc[0].close),
+                detail='Opposing 5m MACD histogram slope and acceleration'))
+        elif c.outcome == 'FAILED':
+            result.at[i, 'macd_warning_before_reclaim'] = False
+        # Duration starts at full confirmation; first loss of the ORIGINAL
+        # 5m EMA/VWAP alignment ends persistence, not the first opposing trade.
+        if bool(c.confirmed):
+            aligned = ((after.ema9 > after.ema20) & (after.close > after.vwap)) if sign == 1 else ((after.ema9 < after.ema20) & (after.close < after.vwap))
+            loss = after[~aligned]
+            if not loss.empty:
+                end = loss.iloc[0].signal_time
+                result.at[i, 'first_alignment_loss_et'] = end
+                result.at[i, 'alignment_persistence_minutes'] = int((end - t).total_seconds() / 60)
+                result.at[i, 'alignment_censored'] = False
+                stage_events.append(dict(time_et=end, event='ALIGNMENT LOST',
+                    candidate_id=c.id, direction=side,
+                    frozen_boundary=float(c.frozen_boundary),
+                    close=float(loss.iloc[0].close),
+                    detail='First 5m candle losing original EMA/VWAP alignment'))
+            else:
+                result.at[i, 'alignment_persistence_minutes'] = int((g.signal_time.iloc[-1] - t).total_seconds() / 60)
+                result.at[i, 'alignment_censored'] = True
+        # Confirmation quality: any completed future 5m candle with an
+        # excursion >=0.25 ATR BEYOND THE FROZEN boundary within the horizon.
+        # A horizon is evaluable only if the complete observation window exists.
+        for horizon in (5, 15):
+            end_t = t + pd.Timedelta(minutes=horizon)
+            future = g[(g.signal_time > t) & (g.signal_time <= end_t)]
+            complete = (len(future) == horizon // 5 and
+                        future.signal_time.iloc[-1] == end_t) if not future.empty else False
+            result.at[i, f'continuation_{horizon}m_evaluable'] = bool(complete)
+            if complete:
+                origin = g[g.signal_time == t]
+                atr = float(origin.atr.iloc[0]) if not origin.empty else float('nan')
+                if np.isfinite(atr) and atr > 0:
+                    extreme = float(future.high.max()) if sign == 1 else float(future.low.min())
+                    move = sign * (extreme - float(c.frozen_boundary))
+                    result.at[i, f'continuation_{horizon}m'] = bool(move >= atr_fraction * atr)
+    stages = pd.DataFrame(stage_events, columns=columns).sort_values('time_et').reset_index(drop=True)
+    metric_rows = []
+    for horizon in (5, 15):
+        evaluable = result[result[f'continuation_{horizon}m'].notna()]
+        metric_rows.append(dict(metric=f'{horizon}m >= {atr_fraction:.2f} ATR beyond frozen box',
+            evaluated=len(evaluable), successes=int(evaluable[f'continuation_{horizon}m'].eq(True).sum()),
+            rate=float(evaluable[f'continuation_{horizon}m'].eq(True).mean()) if len(evaluable) else np.nan))
+    failed = result[result.outcome == 'FAILED']
+    warning_evaluable = failed[failed.macd_warning_before_reclaim.notna()]
+    metric_rows.append(dict(metric='MACD warning before frozen-boundary reclaim',
+        evaluated=len(warning_evaluable),
+        successes=int(warning_evaluable.macd_warning_before_reclaim.eq(True).sum()),
+        rate=float(warning_evaluable.macd_warning_before_reclaim.eq(True).mean()) if len(warning_evaluable) else np.nan))
+    persistence = result[result.confirmed == True]
+    durations = pd.to_numeric(persistence.alignment_persistence_minutes, errors='coerce')
+    completed = persistence[persistence.alignment_censored.eq(False)]
+    metric_rows.append(dict(metric='Completed EMA/VWAP persistence episodes (median minutes)',
+        evaluated=len(completed), successes=np.nan,
+        rate=float(pd.to_numeric(completed.alignment_persistence_minutes, errors='coerce').median()) if len(completed) else np.nan))
+    return stages, result, pd.DataFrame(metric_rows)
+
+
 def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_sessions):
     st.subheader('V15 | Breakout & Reversal Detection Lab')
     b, candidates, events = detection_engine(raw, boxes, reclaim_bars,
@@ -888,6 +1083,31 @@ def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_se
                  f"**Stage:** {last.outcome} | **Crossed:** {last.crossed_at_et.strftime('%I:%M %p ET')}")
     warning_count = int(day_events.event.str.contains('MOMENTUM WEAKENING', na=False).sum()) if not day_events.empty else 0
     st.caption(f'MACD slope + acceleration reversal-warning transitions: {warning_count} (diagnostic, not confirmed reversals).')
+    # V16 stage audit and causal detection-quality diagnostics.
+    stages, stage_candidates, stage_metrics = three_stage_detection(raw, boxes, candidates)
+    stage_day = stages[stages.time_et.dt.date == day] if not stages.empty else stages
+    detailed = stage_candidates[stage_candidates.day == str(day)] if not stage_candidates.empty else stage_candidates
+    st.markdown('**Three-stage breakout timing — 1m / 5m / confirmed**')
+    st.caption('The 1m crossing is an early diagnostic against the box known before that 5m interval. '
+               'Five-minute close and full confirmation are distinct stages. All timestamps are candle close ET.')
+    if not detailed.empty:
+        st.dataframe(detailed[['direction', 'frozen_boundary', 'first_1m_cross_et',
+            'five_min_close_et', 'fully_confirmed_et', 'first_macd_warning_et',
+            'macd_warning_before_reclaim', 'macd_warning_lead_minutes',
+            'first_alignment_loss_et', 'alignment_persistence_minutes',
+            'alignment_censored', 'continuation_5m', 'continuation_15m']],
+            hide_index=True, use_container_width=True)
+        st.download_button('Download three-stage detection audit CSV',
+            detailed.to_csv(index=False), file_name=f'three_stage_{day}.csv',
+            mime='text/csv', key=f'stages_download_{day}')
+    if not stage_day.empty:
+        st.dataframe(stage_day.tail(120), hide_index=True, use_container_width=True)
+    st.markdown('**Detection quality — frozen boundary and reversal warnings**')
+    st.dataframe(stage_metrics, hide_index=True, use_container_width=True)
+    st.caption('ATR continuation uses future 5m highs/lows, not entry prices. '
+               'Open or insufficient-history outcomes are excluded. '
+               'EMA/VWAP persistence is measured from original full confirmation; '
+               'censored durations are not treated as completed trends.')
     st.markdown('**Detection events (Eastern Time)**')
     if day_events.empty:
         st.info('No qualifying boundary-crossing events for this session.')
@@ -922,6 +1142,20 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     fig = go.Figure()
     _, v15_candidates, v15_events = detection_engine(raw, boxes, reclaim_window,
                                                      sustain_window, min_tod_sessions)
+    # Detection-only timestamps: early 1m close vs subsequent 5m decision.
+    stage_events, _, _ = three_stage_detection(raw, boxes, v15_candidates)
+    if not stage_events.empty:
+        for kind, color, shape in [
+            ('FIRST 1M CROSS', '#f59e0b', 'circle-open'),
+            ('FIRST 1M CROSS (PENDING 5M)', '#f59e0b', 'circle'),
+            ('FIVE-MINUTE CLOSE BREAK', '#a855f7', 'diamond-open')]:
+            marks = stage_events[(stage_events.event == kind) &
+                                 (stage_events.time_et.dt.date == day)]
+            if not marks.empty:
+                fig.add_trace(go.Scatter(x=marks.time_et, y=marks.close,
+                    mode='markers', name=kind,
+                    marker=dict(symbol=shape, size=9, color=color),
+                    hovertemplate=kind + '<br>%{x}<br>$%{y:.3f}<extra></extra>'))
     if not v15_events.empty:
         for kind, color, shape in [
             ('CROSSED', '#f59e0b', 'circle-open'),
@@ -1052,7 +1286,7 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V15 | Box Theory & Detection Lab')
+st.title('Stock Movement V16 | Box Theory & Detection Lab')
 st.caption('Research only. V15 frozen-boundary detection, MACD slope/acceleration and time-of-day RVOL are diagnostic only; original trading/backtest signals remain unchanged. No orders are placed.')
 
 with st.sidebar:
