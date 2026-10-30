@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V14', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V15', layout='wide')
 
 
 def secret(*names, default=''):
@@ -615,11 +615,11 @@ def reversal_analysis(raw, boxes, day, reclaim_bars=3):
         # First evaluate a previously opened candidate; never reclaim on same bar.
         if active is not None:
             elapsed = i - active['start_i']
-            reclaimed = ((active['direction'] == 'DOWN' and bar.close > active['boundary'])
-                         or (active['direction'] == 'UP' and bar.close < active['boundary']))
+            reclaimed = ((active['direction'] == 'DOWN' and bar.close > active['frozen_boundary'])
+                         or (active['direction'] == 'UP' and bar.close < active['frozen_boundary']))
             if reclaimed and elapsed <= reclaim_bars:
                 events.append({'time_et': bar.signal_time, 'event': 'FAILED BREAKDOWN' if active['direction']=='DOWN' else 'FAILED BREAKOUT',
-                               'original_break_et': active['break_time'], 'frozen_level': active['boundary'],
+                               'original_break_et': active['break_time'], 'frozen_level': active['frozen_boundary'],
                                'close': float(bar.close), 'bars_to_reclaim': elapsed})
                 active = None
             elif elapsed >= reclaim_bars:
@@ -671,6 +671,243 @@ def render_reversal_panel(raw, boxes, day, reclaim_bars=3):
         st.dataframe(events.tail(20), hide_index=True, use_container_width=True)
 
 
+
+# ================================================================
+# V15 detection-only engine. Does NOT change make_boxes or backtest.
+# ================================================================
+def time_of_day_rvol(raw, boxes, min_sessions=5, history_sessions=20):
+    """5m volume / mean of the SAME ET time slot in prior sessions only.
+
+    No same-session or future observations are used for a reference.
+    Insufficient prior sessions -> NaN, never a fabricated 1.0 ratio.
+    """
+    if boxes.empty:
+        return pd.Series(dtype=float, name='tod_rvol')
+    five = to_five_minute(raw)
+    if five.empty:
+        return pd.Series(np.nan, index=boxes.index, name='tod_rvol')
+    days = sorted(set(five.index.date))
+    results = pd.Series(np.nan, index=boxes.index, dtype=float, name='tod_rvol')
+    for k, day in enumerate(days):
+        earlier = days[max(0, k - history_sessions):k]
+        if len(earlier) < min_sessions:
+            continue
+        hist = five[np.isin(five.index.date, earlier)].copy()
+        hist['slot'] = hist.index.strftime('%H:%M')
+        slot_mean = hist.groupby('slot')['volume'].mean().replace(0, np.nan)
+        today = five[five.index.date == day]
+        vals = today['volume'].to_numpy() / slot_mean.reindex(today.index.strftime('%H:%M')).to_numpy()
+        idx = today.index.intersection(results.index)
+        if len(idx):
+            results.loc[idx] = pd.Series(vals, index=today.index).reindex(idx)
+    return results
+
+
+def detection_engine(raw, boxes, reclaim_bars=3, sustain_bars=2,
+                     min_tod_sessions=5, min_move_atr=0.25):
+    """Causal event state machine on completed 5m bars; no execution decisions.
+
+    Stages: CROSSED -> CONFIRMED or UNCONFIRMED -> SUSTAINED,
+    FAILED (reclaim) or WINDOW EXPIRED. A frozen boundary never moves.
+    Distinct crossings are logged only on transition across the *prior* box.
+    A new crossing can start only when the previous candidate resolves.
+    """
+    if boxes.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    b = boxes.copy().sort_index()
+    b['tod_rvol'] = time_of_day_rvol(raw, b, min_sessions=min_tod_sessions)
+    b['macd_hist'] = np.nan
+    b['macd_slope'] = np.nan
+    b['macd_acceleration'] = np.nan
+    for day, g in b.groupby(b.index.date):
+        fast = g.close.ewm(span=12, adjust=False).mean()
+        slow = g.close.ewm(span=26, adjust=False).mean()
+        macd = fast - slow
+        hist = macd - macd.ewm(span=9, adjust=False).mean()
+        b.loc[g.index, 'macd_hist'] = hist
+        b.loc[g.index, 'macd_slope'] = hist.diff()
+        b.loc[g.index, 'macd_acceleration'] = hist.diff().diff()
+    events = []
+    candidates = []
+    for day, g in b.groupby(b.index.date):
+        active = None
+        prev_up = prev_down = False
+        prev_momentum_warning = None
+        rows = list(g.iterrows())
+        for i, (idx, bar) in enumerate(rows):
+            t = bar.signal_time
+            # A warning is emitted only when an opposing momentum condition
+            # first appears. No repeated event on every subsequent candle.
+            warning = None
+            if i >= 26 and pd.notna(bar.macd_slope) and pd.notna(bar.macd_acceleration):
+                if (bar.ema9 < bar.ema20 and bar.close < bar.vwap and
+                        bar.macd_slope > 0 and bar.macd_acceleration > 0):
+                    warning = 'BEARISH MOMENTUM WEAKENING'
+                elif (bar.ema9 > bar.ema20 and bar.close > bar.vwap and
+                        bar.macd_slope < 0 and bar.macd_acceleration < 0):
+                    warning = 'BULLISH MOMENTUM WEAKENING'
+            if warning is not None and warning != prev_momentum_warning:
+                events.append(dict(time_et=t, event=warning, candidate_id=None,
+                                   direction='UP' if warning.startswith('BEARISH') else 'DOWN',
+                                   frozen_boundary=np.nan, close=float(bar.close),
+                                   bars_since_cross=np.nan))
+            prev_momentum_warning = warning
+            # Use existing strategy eligibility as the source of truth:
+            # price_break_up/down already include configured box-width threshold.
+            up = bool(bar.price_break_up)
+            down = bool(bar.price_break_down)
+            if active is not None:
+                age = i - active['start_i']
+                direction = active['direction']
+                boundary = active['frozen_boundary']
+                reclaimed = bool(bar.close < boundary) if direction == 'UP' else bool(bar.close > boundary)
+                if reclaimed:
+                    active['outcome'] = 'FAILED'
+                    active['resolved_at_et'] = t
+                    active['bars_to_resolution'] = age
+                    events.append(dict(time_et=t, event='FAILED BREAKOUT' if direction == 'UP' else 'FAILED BREAKDOWN',
+                                       candidate_id=active['id'], direction=direction,
+                                       frozen_boundary=boundary, close=float(bar.close), bars_since_cross=age))
+                    active = None
+                elif age == sustain_bars:
+                    events.append(dict(time_et=t, event='SUSTAINED', candidate_id=active['id'],
+                                       direction=direction, frozen_boundary=boundary,
+                                       close=float(bar.close), bars_since_cross=age))
+                    active['sustained'] = True
+                if active is not None and age >= reclaim_bars:
+                    active['outcome'] = 'SUSTAINED / WINDOW EXPIRED' if active['sustained'] else 'WINDOW EXPIRED'
+                    active['resolved_at_et'] = t
+                    active['bars_to_resolution'] = age
+                    active = None
+            # Prevent repeated triggers while price stays outside a moving box.
+            crossed_up = up and not prev_up
+            crossed_down = down and not prev_down
+            prev_up, prev_down = up, down
+            if active is None and (crossed_up or crossed_down):
+                direction = 'UP' if crossed_up else 'DOWN'
+                boundary = float(bar.box_high if crossed_up else bar.box_low)
+                cid = f'{day}-{t.strftime("%H%M")}-{direction}'
+                confirmation = bool(bar.signal == (1 if crossed_up else -1))
+                candidate = dict(id=cid, day=str(day), crossed_at_et=t,
+                                 direction=direction, frozen_boundary=boundary,
+                                 crossing_close=float(bar.close), confirmed=confirmation,
+                                 volume_ratio=float(bar.vol_ratio) if pd.notna(bar.vol_ratio) else np.nan,
+                                 tod_rvol=float(bar.tod_rvol) if pd.notna(bar.tod_rvol) else np.nan,
+                                 macd_slope=float(bar.macd_slope) if pd.notna(bar.macd_slope) else np.nan,
+                                 macd_acceleration=float(bar.macd_acceleration) if pd.notna(bar.macd_acceleration) else np.nan,
+                                 start_i=i, sustained=False, outcome='OPEN / CENSORED',
+                                 resolved_at_et=pd.NaT, bars_to_resolution=np.nan,
+                                 atr=float(bar.atr) if pd.notna(bar.atr) else np.nan)
+                candidates.append(candidate)
+                active = candidate
+                events.append(dict(time_et=t, event='CROSSED', candidate_id=cid,
+                                   direction=direction, frozen_boundary=boundary,
+                                   close=float(bar.close), bars_since_cross=0))
+                events.append(dict(time_et=t, event='CONFIRMED' if confirmation else 'UNCONFIRMED',
+                                   candidate_id=cid, direction=direction, frozen_boundary=boundary,
+                                   close=float(bar.close), bars_since_cross=0))
+        # End-of-file / session is censored, not a false positive.
+    c = pd.DataFrame(candidates)
+    e = pd.DataFrame(events)
+    if c.empty:
+        return b, c, e
+    # Validation: forward price observations only after the crossing candle.
+    # Horizon outcomes are scored only when a future completed candle exists.
+    for minutes in (5, 15, 30):
+        c[f'forward_{minutes}m_bps'] = np.nan
+        c[f'correct_{minutes}m'] = np.nan
+        c[f'meaningful_{minutes}m'] = np.nan
+        for day, g in b.groupby(b.index.date):
+            for row_i in c.index[c.day == str(day)]:
+                start_t = c.at[row_i, 'crossed_at_et']
+                future = g[g.signal_time == start_t + pd.Timedelta(minutes=minutes)]
+                if future.empty:
+                    continue
+                sign = 1 if c.at[row_i, 'direction'] == 'UP' else -1
+                signed_return = sign * (float(future.close.iloc[0]) / c.at[row_i, 'crossing_close'] - 1)
+                c.at[row_i, f'forward_{minutes}m_bps'] = signed_return * 10000
+                c.at[row_i, f'correct_{minutes}m'] = int(signed_return > 0)
+                atr = c.at[row_i, 'atr']
+                if pd.notna(atr) and atr > 0:
+                    c.at[row_i, f'meaningful_{minutes}m'] = int(sign * (float(future.close.iloc[0]) - c.at[row_i, 'crossing_close']) >= min_move_atr * atr)
+    c = c.drop(columns=['start_i', 'atr'])
+    return b, c, e
+
+
+def detection_metrics(candidates):
+    """Matured denominators only; no accuracy claims for censored events."""
+    if candidates.empty:
+        return pd.DataFrame([{'Metric':'Crossing candidates', 'Value':0}])
+    n = len(candidates)
+    closed = candidates[candidates.outcome != 'OPEN / CENSORED']
+    rows = [
+        ('Crossing candidates', n),
+        ('Confirmed by original V14 rules', int(candidates.confirmed.sum())),
+        ('Failed / matured candidates', int((closed.outcome == 'FAILED').sum())),
+        ('Matured candidates', len(closed)),
+        ('Failure rate among matured', float((closed.outcome == 'FAILED').mean()) if len(closed) else np.nan),
+        ('Still open / censored', n - len(closed)),
+        ('Time-of-day RVOL available', int(candidates.tod_rvol.notna().sum())),
+    ]
+    for horizon in (5, 15, 30):
+        eligible = candidates[f'correct_{horizon}m'].dropna()
+        meaningful = candidates[f'meaningful_{horizon}m'].dropna()
+        rows.extend([
+            (f'{horizon}m directional evaluations', len(eligible)),
+            (f'{horizon}m directional hit rate', float(eligible.mean()) if len(eligible) else np.nan),
+            (f'{horizon}m ATR-move evaluations', len(meaningful)),
+            (f'{horizon}m >=0.25 ATR continuation rate', float(meaningful.mean()) if len(meaningful) else np.nan),
+        ])
+    return pd.DataFrame(rows, columns=['Metric','Value'])
+
+
+def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_sessions):
+    st.subheader('V15 | Breakout & Reversal Detection Lab')
+    b, candidates, events = detection_engine(raw, boxes, reclaim_bars,
+                                             sustain_bars, min_tod_sessions)
+    if b.empty:
+        st.info('Waiting for complete five-minute bars.')
+        return
+    day_candidates = candidates[candidates.day == str(day)] if not candidates.empty else candidates
+    day_events = events[events.time_et.dt.date == day] if not events.empty else events
+    a, z, c, d = st.columns(4)
+    a.metric('Box crossings', len(day_candidates))
+    z.metric('V14-confirmed crossings', int(day_candidates.confirmed.sum()) if not day_candidates.empty else 0)
+    c.metric('Failed / reclaimed', int((day_candidates.outcome == 'FAILED').sum()) if not day_candidates.empty else 0)
+    d.metric('Open / censored', int((day_candidates.outcome == 'OPEN / CENSORED').sum()) if not day_candidates.empty else 0)
+    latest = b[b.index.date == day]
+    if not latest.empty:
+        bar = latest.iloc[-1]
+        tod = 'N/A (insufficient prior sessions)' if pd.isna(bar.tod_rvol) else f'{bar.tod_rvol:.2f}x'
+        st.write(f'**Time-of-day RVOL:** {tod} | **5m MACD histogram slope:** {bar.macd_slope:.5f} | **Acceleration:** {bar.macd_acceleration:.5f}')
+        st.caption('Slope = histogram change per completed 5m bar; acceleration = change in slope. '
+                   'Time-of-day RVOL uses only earlier sessions at the same Eastern-time five-minute slot.')
+    if not day_candidates.empty:
+        last = day_candidates.iloc[-1]
+        st.write(f"**Latest frozen boundary:** ${last.frozen_boundary:.3f} ({last.direction}) | "
+                 f"**Stage:** {last.outcome} | **Crossed:** {last.crossed_at_et.strftime('%I:%M %p ET')}")
+    warning_count = int(day_events.event.str.contains('MOMENTUM WEAKENING', na=False).sum()) if not day_events.empty else 0
+    st.caption(f'MACD slope + acceleration reversal-warning transitions: {warning_count} (diagnostic, not confirmed reversals).')
+    st.markdown('**Detection events (Eastern Time)**')
+    if day_events.empty:
+        st.info('No qualifying boundary-crossing events for this session.')
+    else:
+        st.dataframe(day_events.tail(100), hide_index=True, use_container_width=True)
+        st.download_button('Download V15 event log CSV', day_events.to_csv(index=False),
+                           file_name=f'detection_events_{day}.csv', mime='text/csv',
+                           key=f'event_download_{day}')
+    st.markdown('**Detection validation (not trading returns)**')
+    metrics = detection_metrics(day_candidates)
+    st.dataframe(metrics, hide_index=True, use_container_width=True)
+    if not day_candidates.empty:
+        st.download_button('Download V15 candidate validation CSV', day_candidates.to_csv(index=False),
+                           file_name=f'detection_candidates_{day}.csv', mime='text/csv',
+                           key=f'candidate_download_{day}')
+    st.caption('All event states are computed from completed 5m bars. Forward outcomes are retrospective diagnostics, '
+               'never used to generate historical signals. Open cases and missing future candles are excluded from matured rates. '
+               'These measures do not demonstrate predictive accuracy without multi-session holdout testing.')
+
+
 def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12, show_developing_boxes=False):
     # Calculate the indicators on ALL available 1m candles for the day,
     # then slice the display window. This avoids restarting the EMAs when
@@ -683,16 +920,22 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     if visible_bars:
         d = d.tail(visible_bars)
     fig = go.Figure()
+    _, v15_candidates, v15_events = detection_engine(raw, boxes, reclaim_window,
+                                                     sustain_window, min_tod_sessions)
+    if not v15_events.empty:
+        for kind, color, shape in [
+            ('CROSSED', '#f59e0b', 'circle-open'),
+            ('SUSTAINED', '#16a34a', 'diamond'),
+            ('FAILED BREAKOUT', '#a855f7', 'triangle-down'),
+            ('FAILED BREAKDOWN', '#f97316', 'triangle-up')]:
+            marked = v15_events[(v15_events.event == kind) &
+                                (v15_events.time_et.dt.date == day)]
+            if not marked.empty:
+                fig.add_trace(go.Scatter(x=marked.time_et, y=marked.close,
+                    mode='markers', name='V15 ' + kind,
+                    marker=dict(symbol=shape, size=11, color=color),
+                    hovertemplate=kind + '<br>%{x}<br>$%{y:.3f}<extra></extra>'))
     _, _, failed_events = reversal_analysis(raw, boxes, day, reclaim_window)
-    if not failed_events.empty:
-        for event_name, color, marker in [
-            ('FAILED BREAKDOWN', '#f97316', 'triangle-up'),
-            ('FAILED BREAKOUT', '#a855f7', 'triangle-down')]:
-            ev = failed_events[failed_events.event == event_name]
-            fig.add_trace(go.Scatter(x=ev.time_et, y=ev.close, mode='markers',
-                name=event_name, marker=dict(size=13, color=color, symbol=marker,
-                line=dict(color='white', width=1)),
-                hovertemplate=event_name + '<br>%{x}<br>Close: $%{y:.2f}<extra></extra>'))
     if chart_display in ('Candlestick', 'Both'):
         fig.add_trace(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low,
                                      close=d.close, name='Price'))
@@ -809,8 +1052,8 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V14 | Box Theory & Reversal Detection')
-st.caption('Research only. Failed-breakout and MACD reversal warnings are experimental; original five-minute trading/backtest signals remain unchanged. No orders are placed.')
+st.title('Stock Movement V15 | Box Theory & Detection Lab')
+st.caption('Research only. V15 frozen-boundary detection, MACD slope/acceleration and time-of-day RVOL are diagnostic only; original trading/backtest signals remain unchanged. No orders are placed.')
 
 with st.sidebar:
     symbol = st.text_input('U.S. stock / ETF symbol', 'QQQ').strip().upper()
@@ -833,6 +1076,8 @@ with st.sidebar:
     max_width = st.slider('Maximum box width (%)', 0.2, 2.0, 0.9, 0.1)
     vol_mult = st.slider('Breakout relative volume', 1.0, 3.0, 1.2, 0.1)
     reclaim_window = st.slider('Failed-breakout reclaim window (5m bars)', 1, 6, 3)
+    sustain_window = st.slider('Sustained breakout confirmation (5m bars)', 1, 3, 2)
+    min_tod_sessions = st.slider('Minimum prior sessions for time-of-day RVOL', 2, 15, 5)
     hold_minutes = st.selectbox('Maximum holding time', [5, 15, 30, 60], index=2)
     stop_atr = st.slider('Stop distance (ATR multiplier)', 0.5, 3.0, 1.2, 0.1)
     reward_risk = st.slider('Profit target (reward/risk)', 0.5, 4.0, 1.5, 0.1)
@@ -893,6 +1138,7 @@ def live_dashboard():
         st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
         render_trend_duration_tracker(boxes, raw, latest_day)
         render_reversal_panel(raw, boxes, latest_day, reclaim_window)
+        render_detection_lab(raw, boxes, latest_day, reclaim_window, sustain_window, min_tod_sessions)
         day_boxes = boxes[boxes.index.date == latest_day]
         if not day_boxes.empty:
             latest = day_boxes.iloc[-1]
@@ -979,6 +1225,7 @@ if 'test_comparison' in st.session_state:
     st.plotly_chart(fig, use_container_width=True)
     render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
     render_reversal_panel(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window)
+    render_detection_lab(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window, sustain_window, min_tod_sessions)
     st.caption('Backtest and confirmed signals use prior 5m boxes. LIVE 1m rolling box is display-only and can differ from the confirmed 5m box. ET signal times mark 5m candle close.')
     st.subheader('Historical breakout audit')
     audit = breakout_audit(st.session_state['test_boxes'], chosen)
