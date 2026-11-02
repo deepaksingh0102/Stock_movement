@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V16.1', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V16.3 Optimized', layout='wide')
 
 
 def secret(*names, default=''):
@@ -82,10 +82,13 @@ def history(symbol, feed, key, secret_key, today):
     return alpaca_bars(symbol, start.isoformat(), end.isoformat(), feed, key, secret_key)
 
 
-def live(symbol, feed, key, secret_key):
-    now = dt.datetime.now(UTC) - dt.timedelta(minutes=2)
-    end = dt.datetime.fromtimestamp(int(now.timestamp() // 30) * 30, UTC)
-    start = end - dt.timedelta(days=4)
+def live(symbol, feed, key, secret_key, start=None, end=None):
+    """Fetch a small incremental window; preserve the original 2-minute feed buffer."""
+    if end is None:
+        now = dt.datetime.now(UTC) - dt.timedelta(minutes=2)
+        end = dt.datetime.fromtimestamp(int(now.timestamp() // 60) * 60, UTC)
+    if start is None:
+        start = end - dt.timedelta(days=4)  # Initial bootstrap only.
     return alpaca_bars(symbol, start.isoformat(), end.isoformat(), feed, key, secret_key)
 
 
@@ -107,21 +110,50 @@ def is_regular_session_open():
 
 
 def load_market_data(symbol, feed, key, secret_key):
-    """Fetch live during session; reuse last snapshot when closed.
+    """One bootstrap, then fetch only new 1m candles (with a 3m overlap).
 
-    On a first visit outside market hours, fetch once to populate the chart.
-    The cache is isolated per symbol, feed, and New York calendar day.
+    A 30s UI refresh is retained, but the API is queried only when the
+    buffered, completed-minute end time advances. Each session's snapshot
+    is isolated by symbol, feed, and ET calendar date.
     """
     today = dt.datetime.now(NY).date()
     cache_id = f'market_snapshot:{symbol}:{feed}:{today.isoformat()}'
-    if not is_regular_session_open() and cache_id in st.session_state:
-        return st.session_state[cache_id].copy()
+    minute_id = cache_id + ':last_request_end'
+    existing = st.session_state.get(cache_id)
+    if not is_regular_session_open() and existing is not None:
+        return existing.copy()
 
-    old = history(symbol, feed, key, secret_key, today.isoformat())
-    recent = live(symbol, feed, key, secret_key)
-    raw = merge_data(old, recent)
+    now = dt.datetime.now(UTC) - dt.timedelta(minutes=2)
+    end = dt.datetime.fromtimestamp(int(now.timestamp() // 60) * 60, UTC)
+    if existing is not None and st.session_state.get(minute_id) == end:
+        return existing.copy()
+
+    if existing is None:
+        old = history(symbol, feed, key, secret_key, today.isoformat())
+        # Initial load: recent bars cover the last few days; subsequent calls
+        # never repeat this bootstrap range.
+        recent = live(symbol, feed, key, secret_key, end=end)
+        raw = merge_data(old, recent)
+    else:
+        # Request only missing minutes. Re-fetch 3 minutes to account for
+        # late/revised bars and overwrite duplicates with newer values.
+        latest_start_utc = existing.index[-1].tz_convert('UTC').to_pydatetime()
+        start = max(latest_start_utc - dt.timedelta(minutes=3),
+                    end - dt.timedelta(days=1))
+        if start >= end:
+            st.session_state[minute_id] = end
+            return existing.copy()
+        try:
+            recent = live(symbol, feed, key, secret_key, start=start, end=end)
+        except ValueError as exc:
+            if 'No bars returned' not in str(exc):
+                raise
+            recent = existing.iloc[0:0]
+        raw = merge_data(existing, recent) if not recent.empty else existing
+
     st.session_state[cache_id] = raw.copy()
-    return raw
+    st.session_state[minute_id] = end
+    return raw.copy()
 
 
 def merge_data(a, b):
@@ -163,6 +195,7 @@ def levels_for_day(raw, date, opening_minutes=15):
     return result
 
 
+@st.cache_data(show_spinner=False, ttl=600, max_entries=8)
 def make_boxes(raw, lookback=12, max_width_pct=0.9, vol_multiplier=1.2,
                require_trend=True, require_volume=True):
     """Rolling Darvas-style boxes: prior N complete 5m candles in same session.
@@ -1056,10 +1089,86 @@ def three_stage_detection(raw, boxes, candidates, atr_fraction=0.25):
     return stages, result, pd.DataFrame(metric_rows)
 
 
-def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_sessions):
+@st.cache_data(show_spinner=False, ttl=600, max_entries=6)
+def shared_detection_results(raw, boxes, reclaim_bars, sustain_bars, min_tod_sessions):
+    """Calculate the expensive V15/V16 detection layers exactly once.
+
+    Streamlit's cache reuses results when 30-second ticks see the same bars.
+    When new 1m bars arrive, the bundle is recalculated only once and shared
+    between the price chart and the Detection Lab.
+    """
+    b, candidates, events = detection_engine(
+        raw, boxes, reclaim_bars, sustain_bars, min_tod_sessions)
+    stages, detailed, metrics = three_stage_detection(raw, boxes, candidates)
+    return b, candidates, events, stages, detailed, metrics
+
+
+
+
+def episode_confirmation_audit(boxes, candidates, stages=None):
+    """Detection-only progression; does not change signals, entries or exits.
+
+    A candidate may become confirmed later while the original frozen level
+    remains broken and its reclaim window has not ended. Never backdate
+    confirmation: the recorded time is the completed 5m candle close.
+    """
+    columns = ['direction', 'first_1m_cross_et', 'five_min_break_et',
+               'first_full_confirmation_et', 'delay_from_1m_min',
+               'confirmation_status', 'frozen_boundary', 'episode_outcome',
+               'initial_volume_ratio', 'initial_volume_pass',
+               'initial_trend_pass', 'initial_candle_pass']
+    if candidates.empty or boxes.empty:
+        return pd.DataFrame(columns=columns)
+    first_cross = {}
+    if stages is not None and not stages.empty:
+        early = stages[stages.event == 'FIRST 1M CROSS']
+        for _, row in early.iterrows():
+            first_cross[(row.time_et.floor('5min'), row.direction)] = row.time_et
+    rows = []
+    for _, c in candidates.iterrows():
+        t = pd.Timestamp(c.crossed_at_et)
+        direction = 1 if c.direction == 'UP' else -1
+        end = pd.Timestamp(c.resolved_at_et) if pd.notna(c.resolved_at_et) else boxes.signal_time.max()
+        # Never cross session boundaries.
+        relevant = boxes[(boxes.index.date == t.date()) &
+                         (boxes.signal_time >= t) & (boxes.signal_time <= end)]
+        confirmed = relevant[relevant.signal == direction]
+        if direction == 1:
+            confirmed = confirmed[confirmed.close > float(c.frozen_boundary)]
+        else:
+            confirmed = confirmed[confirmed.close < float(c.frozen_boundary)]
+        confirmation_time = confirmed.signal_time.iloc[0] if not confirmed.empty else pd.NaT
+        first = first_cross.get((t - pd.Timedelta(minutes=5), c.direction), pd.NaT)
+        initial = relevant[relevant.signal_time == t]
+        if not initial.empty:
+            bar = initial.iloc[0]
+            trend = bool(bar.trend_long_ok if direction == 1 else bar.trend_short_ok)
+            candle = bool(bar.close > bar.open if direction == 1 else bar.close < bar.open)
+        else:
+            trend, candle = False, False
+        rows.append({
+            'direction': c.direction, 'first_1m_cross_et': first,
+            'five_min_break_et': t,
+            'first_full_confirmation_et': confirmation_time,
+            'delay_from_1m_min': (confirmation_time - first).total_seconds()/60
+                if pd.notna(confirmation_time) and pd.notna(first) else np.nan,
+            'confirmation_status': ('CONFIRMED AT CROSS' if pd.notna(confirmation_time) and confirmation_time == t
+                                    else 'CONFIRMED LATER' if pd.notna(confirmation_time)
+                                    else 'UNCONFIRMED / CENSORED' if c.outcome == 'OPEN / CENSORED'
+                                    else 'UNCONFIRMED'),
+            'frozen_boundary': float(c.frozen_boundary),
+            'episode_outcome': c.outcome,
+            'initial_volume_ratio': float(c.volume_ratio) if pd.notna(c.volume_ratio) else np.nan,
+            'initial_volume_pass': bool(bar.volume_ok) if not initial.empty else False,
+            'initial_trend_pass': trend, 'initial_candle_pass': candle})
+    return pd.DataFrame(rows, columns=columns)
+
+def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_sessions, detection_bundle=None):
     st.subheader('V15 | Breakout & Reversal Detection Lab')
-    b, candidates, events = detection_engine(raw, boxes, reclaim_bars,
-                                             sustain_bars, min_tod_sessions)
+    if detection_bundle is None:
+        detection_bundle = shared_detection_results(
+            raw, boxes, reclaim_bars, sustain_bars, min_tod_sessions)
+    b, candidates, events, stages, stage_candidates, stage_metrics = detection_bundle
     if b.empty:
         st.info('Waiting for complete five-minute bars.')
         return
@@ -1067,7 +1176,7 @@ def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_se
     day_events = events[events.time_et.dt.date == day] if not events.empty else events
     a, z, c, d = st.columns(4)
     a.metric('Box crossings', len(day_candidates))
-    z.metric('V14-confirmed crossings', int(day_candidates.confirmed.sum()) if not day_candidates.empty else 0)
+    z.metric('Confirmed episodes (incl. later)', int(episode_confirmation_audit(boxes, day_candidates, stages)['first_full_confirmation_et'].notna().sum()) if not day_candidates.empty else 0)
     c.metric('Failed / reclaimed', int((day_candidates.outcome == 'FAILED').sum()) if not day_candidates.empty else 0)
     d.metric('Open / censored', int((day_candidates.outcome == 'OPEN / CENSORED').sum()) if not day_candidates.empty else 0)
     latest = b[b.index.date == day]
@@ -1084,9 +1193,20 @@ def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_se
     warning_count = int(day_events.event.str.contains('MOMENTUM WEAKENING', na=False).sum()) if not day_events.empty else 0
     st.caption(f'MACD slope + acceleration reversal-warning transitions: {warning_count} (diagnostic, not confirmed reversals).')
     # V16 stage audit and causal detection-quality diagnostics.
-    stages, stage_candidates, stage_metrics = three_stage_detection(raw, boxes, candidates)
     stage_day = stages[stages.time_et.dt.date == day] if not stages.empty else stages
     detailed = stage_candidates[stage_candidates.day == str(day)] if not stage_candidates.empty else stage_candidates
+    # Episode-aware audit: unlike the original candidate.confirmed field,
+    # this captures a full confirmation occurring AFTER the initial crossing.
+    episode_audit = episode_confirmation_audit(boxes, day_candidates, stages)
+    with st.expander('Breakout episode progression and rejection reasons', expanded=True):
+        st.caption('Each row follows a frozen boundary. A later confirmation is recorded at its actual 5m close, never at the earlier crossing. Initial filter diagnostics explain why the first break was not confirmed.')
+        if episode_audit.empty:
+            st.info('No crossing episodes on this session.')
+        else:
+            st.dataframe(episode_audit, hide_index=True, use_container_width=True)
+            st.download_button('Download episode confirmation audit', episode_audit.to_csv(index=False),
+                               file_name=f'episode_audit_{day}.csv', mime='text/csv',
+                               key=f'episode_audit_download_{day}')
     st.markdown('**Three-stage breakout timing — 1m / 5m / confirmed**')
     st.caption('The 1m crossing is an early diagnostic against the box known before that 5m interval. '
                'Five-minute close and full confirmation are distinct stages. All timestamps are candle close ET.')
@@ -1128,7 +1248,7 @@ def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_se
                'These measures do not demonstrate predictive accuracy without multi-session holdout testing.')
 
 
-def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12, show_developing_boxes=False):
+def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12, show_developing_boxes=False, detection_bundle=None):
     # Calculate the indicators on ALL available 1m candles for the day,
     # then slice the display window. This avoids restarting the EMAs when
     # switching from Since market open to 5/15/60 minutes.
@@ -1140,10 +1260,10 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     if visible_bars:
         d = d.tail(visible_bars)
     fig = go.Figure()
-    _, v15_candidates, v15_events = detection_engine(raw, boxes, reclaim_window,
-                                                     sustain_window, min_tod_sessions)
-    # Detection-only timestamps: early 1m close vs subsequent 5m decision.
-    stage_events, _, _ = three_stage_detection(raw, boxes, v15_candidates)
+    if detection_bundle is None:
+        detection_bundle = shared_detection_results(
+            raw, boxes, reclaim_window, sustain_window, min_tod_sessions)
+    _, v15_candidates, v15_events, stage_events, _, _ = detection_bundle
     if not stage_events.empty:
         for kind, color, shape in [
             ('FIRST 1M CROSS', '#f59e0b', 'circle-open'),
@@ -1169,7 +1289,6 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
                     mode='markers', name='V15 ' + kind,
                     marker=dict(symbol=shape, size=11, color=color),
                     hovertemplate=kind + '<br>%{x}<br>$%{y:.3f}<extra></extra>'))
-    _, _, failed_events = reversal_analysis(raw, boxes, day, reclaim_window)
     if chart_display in ('Candlestick', 'Both'):
         fig.add_trace(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low,
                                      close=d.close, name='Price'))
@@ -1286,7 +1405,7 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
     return fig, levels
 
 
-st.title('Stock Movement V16.1 | Box Theory & Detection Lab')
+st.title('Stock Movement V16.3 | Optimized Detection Lab')
 st.caption('Research only. V15 frozen-boundary detection, MACD slope/acceleration and time-of-day RVOL are diagnostic only; original trading/backtest signals remain unchanged. No orders are placed.')
 
 # Pausing disables the fragment timer itself, not just Alpaca requests.
@@ -1381,7 +1500,9 @@ def live_dashboard():
             return
         boxes = make_boxes(raw, lookback, max_width, vol_mult, True, True)
         latest_day = raw.index[-1].date()
-        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback, show_developing_boxes)
+        detection_bundle = shared_detection_results(
+            raw, boxes, reclaim_window, sustain_window, min_tod_sessions)
+        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback, show_developing_boxes, detection_bundle=detection_bundle)
         st.subheader(f'{symbol} | Live chart')
         if pause_live_refresh:
             st.warning('DISPLAY PAUSED - showing the saved snapshot. Signals are not live. '
@@ -1399,7 +1520,7 @@ def live_dashboard():
         st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
         render_trend_duration_tracker(boxes, raw, latest_day)
         render_reversal_panel(raw, boxes, latest_day, reclaim_window)
-        render_detection_lab(raw, boxes, latest_day, reclaim_window, sustain_window, min_tod_sessions)
+        render_detection_lab(raw, boxes, latest_day, reclaim_window, sustain_window, min_tod_sessions, detection_bundle=detection_bundle)
         day_boxes = boxes[boxes.index.date == latest_day]
         if not day_boxes.empty:
             latest = day_boxes.iloc[-1]
@@ -1481,12 +1602,15 @@ if 'test_comparison' in st.session_state:
         st.dataframe(trades.tail(50), use_container_width=True)
     dates = sorted(set(st.session_state['test_raw'].index.date))
     chosen = st.selectbox('Historical chart replay day', dates, index=len(dates)-1)
+    replay_bundle = shared_detection_results(
+        st.session_state['test_raw'], st.session_state['test_boxes'],
+        reclaim_window, sustain_window, min_tod_sessions)
     fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
-                                chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes)
+                                chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes, detection_bundle=replay_bundle)
     st.plotly_chart(fig, use_container_width=True)
     render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
     render_reversal_panel(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window)
-    render_detection_lab(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window, sustain_window, min_tod_sessions)
+    render_detection_lab(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window, sustain_window, min_tod_sessions, detection_bundle=replay_bundle)
     st.caption('Backtest and confirmed signals use prior 5m boxes. LIVE 1m rolling box is display-only and can differ from the confirmed 5m box. ET signal times mark 5m candle close.')
     st.subheader('Historical breakout audit')
     audit = breakout_audit(st.session_state['test_boxes'], chosen)
