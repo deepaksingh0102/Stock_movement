@@ -30,10 +30,19 @@ def clean(raw, naive_tz='America/New_York'):
         times = pd.to_datetime(df['timestamp_utc'], errors='coerce', utc=True)
         df.index = pd.DatetimeIndex(times).tz_convert(NY)
     elif 'timestamp' in df.columns:
-        times = pd.to_datetime(df['timestamp'], errors='coerce')
-        if times.dt.tz is None:
+        # Explicit offsets can differ across DST. Parse mixed-offset timestamps
+        # in UTC before converting to New York; preserve naive CSV handling.
+        values = df['timestamp'].astype(str).str.strip()
+        offset_aware = values.str.contains(r'(?:Z|[+-]\d{2}:?\d{2})$', regex=True, case=False)
+        if offset_aware.all():
+            times = pd.to_datetime(values, errors='coerce', utc=True)
+            df.index = pd.DatetimeIndex(times).tz_convert(NY)
+        elif not offset_aware.any():
+            times = pd.to_datetime(values, errors='coerce')
             times = times.dt.tz_localize(naive_tz, ambiguous='NaT', nonexistent='NaT')
-        df.index = pd.DatetimeIndex(times).tz_convert(NY)
+            df.index = pd.DatetimeIndex(times).tz_convert(NY)
+        else:
+            raise ValueError('CSV contains mixed timezone-aware and naive timestamps')
     elif isinstance(df.index, pd.DatetimeIndex):
         df.index = (df.index.tz_localize(naive_tz) if df.index.tz is None else df.index).tz_convert(NY)
     else:
@@ -1248,7 +1257,7 @@ def render_detection_lab(raw, boxes, day, reclaim_bars, sustain_bars, min_tod_se
                'These measures do not demonstrate predictive accuracy without multi-session holdout testing.')
 
 
-def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12, show_developing_boxes=False, detection_bundle=None):
+def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display="Both", box_lookback=12, show_developing_boxes=False, detection_bundle=None, signal_visibility="Important only"):
     # Calculate the indicators on ALL available 1m candles for the day,
     # then slice the display window. This avoids restarting the EMAs when
     # switching from Since market open to 5/15/60 minutes.
@@ -1264,31 +1273,7 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
         detection_bundle = shared_detection_results(
             raw, boxes, reclaim_window, sustain_window, min_tod_sessions)
     _, v15_candidates, v15_events, stage_events, _, _ = detection_bundle
-    if not stage_events.empty:
-        for kind, color, shape in [
-            ('FIRST 1M CROSS', '#f59e0b', 'circle-open'),
-            ('FIRST 1M CROSS (PENDING 5M)', '#f59e0b', 'circle'),
-            ('FIVE-MINUTE CLOSE BREAK', '#a855f7', 'diamond-open')]:
-            marks = stage_events[(stage_events.event == kind) &
-                                 (stage_events.time_et.dt.date == day)]
-            if not marks.empty:
-                fig.add_trace(go.Scatter(x=marks.time_et, y=marks.close,
-                    mode='markers', name=kind,
-                    marker=dict(symbol=shape, size=9, color=color),
-                    hovertemplate=kind + '<br>%{x}<br>$%{y:.3f}<extra></extra>'))
-    if not v15_events.empty:
-        for kind, color, shape in [
-            ('CROSSED', '#f59e0b', 'circle-open'),
-            ('SUSTAINED', '#16a34a', 'diamond'),
-            ('FAILED BREAKOUT', '#a855f7', 'triangle-down'),
-            ('FAILED BREAKDOWN', '#f97316', 'triangle-up')]:
-            marked = v15_events[(v15_events.event == kind) &
-                                (v15_events.time_et.dt.date == day)]
-            if not marked.empty:
-                fig.add_trace(go.Scatter(x=marked.time_et, y=marked.close,
-                    mode='markers', name='V15 ' + kind,
-                    marker=dict(symbol=shape, size=11, color=color),
-                    hovertemplate=kind + '<br>%{x}<br>$%{y:.3f}<extra></extra>'))
+    # Signal markers are drawn LAST so candles and overlays cannot obscure them.
     if chart_display in ('Candlestick', 'Both'):
         fig.add_trace(go.Candlestick(x=d.index, open=d.open, high=d.high, low=d.low,
                                      close=d.close, name='Price'))
@@ -1356,12 +1341,6 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
                                      hovertemplate=(
                                          '%{x}<br>' + label + ': $%{y:.3f}' +
                                          '<br>5m close: %{customdata:.3f}<extra></extra>')))
-        for side, color, marker, label in [(1, 'green', 'triangle-up', 'Confirmed UP'),
-                                           (-1, 'red', 'triangle-down', 'Confirmed DOWN')]:
-            ev = confirmed_events[confirmed_events.signal == side]
-            fig.add_trace(go.Scatter(x=ev.signal_time, y=ev.close,
-                                     mode='markers', name=label,
-                                     marker=dict(color=color, size=12, symbol=marker)))
     # Chart indicators use 1m candles, unlike the box strategy's 5m
     # EMA/VWAP confirmation. Draw them even before the first box exists.
     for field, color, label in [
@@ -1398,14 +1377,125 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
                     y=[arr[a], arr[a] + slope * (len(b)-1-a)], mode='lines',
                     name='Resistance trendline' if is_high else 'Support trendline',
                     line=dict(color=color, width=2, dash='dash')))
+    # V16.6 visual-only signal overlay: event detection and trade rules unchanged.
+    display_events = []
+    if signal_visibility != 'Hide markers':
+        if not stage_events.empty:
+            for _, e in stage_events.iterrows():
+                if e['time_et'].date() != day: continue
+                k = str(e['event'])
+                if k not in ('FIRST 1M CROSS', 'FIRST 1M CROSS (PENDING 5M)', 'FIVE-MINUTE CLOSE BREAK'): continue
+                if signal_visibility == 'Important only' and k != 'FIRST 1M CROSS': continue
+                display_events.append(dict(time=e['time_et'], price=e['close'], kind=k,
+                    direction=e.get('direction',''), boundary=e.get('frozen_boundary',np.nan),
+                    detail=e.get('detail',''), priority=1 if k.startswith('FIRST') else 2))
+        if not v15_events.empty:
+            for _, e in v15_events.iterrows():
+                if e['time_et'].date() != day: continue
+                k = str(e['event'])
+                if k not in ('CROSSED', 'SUSTAINED', 'FAILED BREAKOUT', 'FAILED BREAKDOWN'): continue
+                if signal_visibility == 'Important only' and k not in ('FAILED BREAKOUT', 'FAILED BREAKDOWN'): continue
+                display_events.append(dict(time=e['time_et'], price=e['close'], kind='V15 '+k,
+                    direction=e.get('direction',''), boundary=e.get('frozen_boundary',np.nan),
+                    detail='Frozen box event', priority=3 if 'FAILED' in k else 2))
+        if not b.empty:
+            for _, e in b[b.signal != 0].iterrows():
+                display_events.append(dict(time=e.signal_time, price=e.close,
+                    kind='CONFIRMED UP' if e.signal == 1 else 'CONFIRMED DOWN',
+                    direction='UP' if e.signal == 1 else 'DOWN',
+                    boundary=e.box_high if e.signal == 1 else e.box_low,
+                    detail=f'EMA9 {e.ema9:.3f} | EMA20 {e.ema20:.3f} | VWAP {e.vwap:.3f} | Volume {e.vol_ratio:.2f}x',
+                    priority=4))
+        styles = {
+            'FIRST 1M CROSS': ('#f59e0b','circle',16),
+            'FIRST 1M CROSS (PENDING 5M)': ('#f59e0b','circle-open',15),
+            'FIVE-MINUTE CLOSE BREAK': ('#a855f7','diamond',17),
+            'V15 CROSSED': ('#d97706','circle-open',17),
+            'V15 SUSTAINED': ('#16a34a','diamond',18),
+            'V15 FAILED BREAKOUT': ('#a855f7','triangle-down',20),
+            'V15 FAILED BREAKDOWN': ('#ea580c','triangle-up',20),
+            'CONFIRMED UP': ('#16a34a','triangle-up',22),
+            'CONFIRMED DOWN': ('#dc2626','triangle-down',22),
+        }
+        display_events = [e for e in display_events if not d.empty and d.index.min() <= e['time'] <= d.index[-1] + pd.Timedelta(minutes=1)]
+        for kind, (color, symbol_marker, size) in styles.items():
+            events_for_kind = [e for e in display_events if e['kind'] == kind]
+            if not events_for_kind: continue
+            fig.add_trace(go.Scatter(
+                x=[e['time'] for e in events_for_kind], y=[e['price'] for e in events_for_kind],
+                mode='markers', name=kind, legendgroup='highlight-'+kind,
+                marker=dict(symbol=symbol_marker, size=size, color=color,
+                            line=dict(color='#ffffff', width=2.5)),
+                customdata=[[e['direction'], e['boundary'], e['detail']] for e in events_for_kind],
+                hovertemplate='<b>'+kind+'</b><br>%{x}<br>Close $%{y:.3f}<br>Direction %{customdata[0]}<br>Frozen boundary $%{customdata[1]:.3f}<br>%{customdata[2]}<extra></extra>'))
+        if display_events:
+            latest_event = max(display_events, key=lambda e: (e['time'], e['priority']))
+            fig.add_vline(x=latest_event['time'].timestamp()*1000,
+                          line_color='#f59e0b', line_dash='dot', line_width=2,
+                          opacity=0.65)
+    else:
+        latest_event = None
     fig.update_layout(height=600,
                       title=f'{day} | Previous completed box (5m candle close, ET)',
                       xaxis_title='Eastern Time', yaxis_title='Price ($)',
                       xaxis_rangeslider_visible=False)
-    return fig, levels
+    return fig, levels, latest_event
 
 
-st.title('Stock Movement V16.3 | Optimized Detection Lab')
+
+
+def historical_detection_threshold_study(raw, lookback=12, max_width=0.9,
+                                         thresholds=(1.0, 1.1, 1.2, 1.3),
+                                         train_fraction=0.7):
+    """Research-only: compare detection selectivity using chronological holdout.
+
+    The official live strategy and backtest thresholds are NOT modified.
+    Continuation is the existing diagnostic: 0.25 ATR beyond frozen box,
+    observed within 5 or 15 minutes, and only with complete future bars.
+    """
+    days = sorted(set(raw.index.date))
+    if len(days) < 15:
+        raise ValueError('At least 15 sessions required for a threshold comparison')
+    cutoff = days[max(1, min(len(days)-1, int(len(days)*train_fraction)))]
+    output = []
+    for threshold in thresholds:
+        boxes = make_boxes(raw, lookback, max_width, threshold, True, True)
+        _, candidates, _ = detection_engine(raw, boxes, 3, 2, 5)
+        if candidates.empty:
+            continue
+        # Episode confirmation can occur later, but only while the original
+        # frozen boundary remains broken inside the existing reclaim window.
+        audit = episode_confirmation_audit(boxes, candidates)
+        audit['session'] = [pd.Timestamp(t).date() for t in candidates.crossed_at_et]
+        audit['confirmed'] = audit.first_full_confirmation_et.notna()
+        audit['failed'] = candidates.outcome.to_numpy() == 'FAILED'
+        audit['matured'] = candidates.outcome.to_numpy() != 'OPEN / CENSORED'
+        for minutes in (5, 15):
+            audit[f'continuation_{minutes}m'] = pd.to_numeric(
+                candidates[f'meaningful_{minutes}m'].to_numpy(), errors='coerce')
+        for period, subset in [('Earlier sessions', audit[audit.session < cutoff]),
+                               ('Holdout sessions', audit[audit.session >= cutoff])]:
+            confirmed = subset[subset.confirmed]
+            matured = subset[subset.matured]
+            result = {
+                'Volume threshold': threshold,
+                'Period': period,
+                'Crossing episodes': len(subset),
+                'Confirmed episodes': len(confirmed),
+                'Failed / reclaimed episodes': int(matured.failed.sum()),
+                'Matured episodes': len(matured),
+                'Median confirmation delay (min)': pd.to_numeric(
+                    confirmed.delay_from_1m_min, errors='coerce').median(),
+            }
+            for minutes in (5, 15):
+                observed = confirmed[f'continuation_{minutes}m'].dropna()
+                result[f'{minutes}m evaluated'] = len(observed)
+                result[f'{minutes}m continuation rate'] = (
+                    observed.mean() if len(observed) else float('nan'))
+            output.append(result)
+    return pd.DataFrame(output), cutoff
+
+st.title('Stock Movement V16.5 | Box Theory & Detection Lab')
 st.caption('Research only. V15 frozen-boundary detection, MACD slope/acceleration and time-of-day RVOL are diagnostic only; original trading/backtest signals remain unchanged. No orders are placed.')
 
 # Pausing disables the fragment timer itself, not just Alpaca requests.
@@ -1432,6 +1522,8 @@ with st.sidebar:
     show_developing_boxes = st.checkbox('Show developing/live boxes', value=False,
                                        help='Optional visual-only box lines. Red and blue trading boxes remain visible.')
     chart_display = st.selectbox('Chart display', ['Candlestick', 'Line', 'Both'], index=2)
+    signal_visibility = st.selectbox('Signal visibility', ['Important only', 'All events', 'Hide markers'], index=0,
+        help='Important: first 1m crossing, confirmed UP/DOWN and failed breakout. All: includes intermediate five-minute and V15 stages.')
     window = st.selectbox('Chart timeframe', ['5 minutes', '15 minutes', '1 hour',
                                               '2 hours', '4 hours', 'Since market open'], index=5)
     windows = {'5 minutes': 5, '15 minutes': 15, '1 hour': 60,
@@ -1502,7 +1594,7 @@ def live_dashboard():
         latest_day = raw.index[-1].date()
         detection_bundle = shared_detection_results(
             raw, boxes, reclaim_window, sustain_window, min_tod_sessions)
-        fig, levels = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback, show_developing_boxes, detection_bundle=detection_bundle)
+        fig, levels, latest_event = chart_for_day(raw, boxes, latest_day, opening, windows[window], chart_display, lookback, show_developing_boxes, detection_bundle=detection_bundle, signal_visibility=signal_visibility)
         st.subheader(f'{symbol} | Live chart')
         if pause_live_refresh:
             st.warning('DISPLAY PAUSED - showing the saved snapshot. Signals are not live. '
@@ -1516,6 +1608,14 @@ def live_dashboard():
         st.caption(f'Latest candle: {raw.index[-1]} | Feed: {feed.upper()} | 1-minute chart indicators; box signals use completed 5-minute candles')
         if (dt.datetime.now(NY) - raw.index[-1]).total_seconds() > 300:
             st.warning('Data is stale or market is closed. Do not treat this as a live entry.')
+        if latest_event is not None:
+            stamp = pd.Timestamp(latest_event['time']).strftime('%I:%M %p ET')
+            event_id = f"{symbol}|{latest_day}|{latest_event['kind']}|{latest_event['time'].isoformat()}"
+            if st.session_state.get('last_highlighted_event_id') != event_id:
+                st.session_state['last_highlighted_event_id'] = event_id
+            st.info(f"LATEST CHART EVENT: {latest_event['kind']} | {stamp} | "
+                    f"${latest_event['price']:.2f} | {latest_event['direction']}. "
+                    "Historical detection event, not an entry recommendation.")
         st.plotly_chart(fig, use_container_width=True)
         st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
         render_trend_duration_tracker(boxes, raw, latest_day)
@@ -1605,7 +1705,7 @@ if 'test_comparison' in st.session_state:
     replay_bundle = shared_detection_results(
         st.session_state['test_raw'], st.session_state['test_boxes'],
         reclaim_window, sustain_window, min_tod_sessions)
-    fig, levels = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
+    fig, levels, _ = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
                                 chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes, detection_bundle=replay_bundle)
     st.plotly_chart(fig, use_container_width=True)
     render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
@@ -1621,3 +1721,37 @@ if 'test_comparison' in st.session_state:
                            mime='text/csv')
     else:
         st.info('No previous-box price breakouts detected on this day.')
+
+
+# V16.5: optional, manually executed research. Never runs on the 30s live timer.
+with st.expander('60-day detection threshold study (manual research)', expanded=False):
+    st.caption('Compares volume thresholds 1.0x, 1.1x, 1.2x and 1.3x. '
+               'Uses a chronological 70/30 split, keeps the existing trade rules '
+               'unchanged, and excludes future windows without complete candles. '
+               'This study is intentionally NOT run on automatic refresh.')
+    if st.button('Run detection threshold comparison', key='run_threshold_study'):
+        if raw_uploaded is not None:
+            research_raw = raw_uploaded
+        elif 'test_raw' in st.session_state:
+            research_raw = st.session_state['test_raw']
+        else:
+            research_raw = None
+        if research_raw is None:
+            st.info('Upload the historical QQQ CSV in the sidebar, or run the historical backtest first.')
+        else:
+            try:
+                with st.spinner('Evaluating historical detection episodes...'):
+                    result, cutoff = historical_detection_threshold_study(
+                        research_raw, lookback, max_width)
+                st.session_state['v165_threshold_result'] = result
+                st.session_state['v165_threshold_cutoff'] = cutoff
+            except Exception as exc:
+                st.error(f'Detection study failed: {exc}')
+    if 'v165_threshold_result' in st.session_state:
+        result = st.session_state['v165_threshold_result']
+        st.caption(f"Holdout starts {st.session_state['v165_threshold_cutoff']}. "
+                   'This is a descriptive comparison, not a trading-performance test.')
+        st.dataframe(result, hide_index=True, use_container_width=True)
+        st.download_button('Download threshold study CSV', result.to_csv(index=False),
+                           file_name='detection_threshold_study.csv', mime='text/csv',
+                           key='v165_threshold_csv')
