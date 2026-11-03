@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V16.3 Optimized', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V16.7 Follow-Through', layout='wide')
 
 
 def secret(*names, default=''):
@@ -1445,6 +1445,127 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
 
 
 
+# V16.7: Display-only breakout follow-through; no changes to signal/backtest rules.
+def breakout_followthrough(raw, boxes, day, atr_extension=0.25, adverse_atr=0.15):
+    """Evaluate unique confirmed breakout episodes using information available as of each candle.
+
+    The frozen boundary is the *prior* completed 5m box at initial confirmation.
+    Five-minute candle indexes are START times; signal_time is the END time.
+    No future candles are consulted in the live snapshot.
+    """
+    b = boxes[boxes.index.date == day].sort_index().copy()
+    d = raw[raw.index.date == day].sort_index().copy()
+    if b.empty or d.empty:
+        return pd.DataFrame()
+    asof = d.index[-1] + pd.Timedelta(minutes=1)
+    completed = b[b.signal_time <= asof]
+    if completed.empty:
+        return pd.DataFrame()
+    # An episode starts with the first confirmation. Repeated same-direction
+    # confirmations do not create new independent signals while it is active.
+    episodes = []
+    active = None
+    for t, r in completed.iterrows():
+        close_time = pd.Timestamp(r.signal_time)
+        if active is not None:
+            breached = (r.close <= active['boundary'] if active['direction'] == 'UP'
+                        else r.close >= active['boundary'])
+            if breached:
+                active['failed_at'] = close_time
+                active = None
+        side = int(r.signal)
+        if side == 0:
+            continue
+        direction = 'UP' if side == 1 else 'DOWN'
+        if active is not None:
+            # New same-direction signals are duplicates of the active episode.
+            if active['direction'] == direction:
+                continue
+            # Opposite confirmation retires the earlier episode.
+            active['superseded_at'] = close_time
+            active = None
+        boundary = float(r.box_high if side == 1 else r.box_low)
+        if not np.isfinite(boundary):
+            continue
+        active = {'direction': direction, 'confirmed_at': close_time,
+                  'confirmation_close': float(r.close), 'boundary': boundary,
+                  'atr': float(r.atr) if pd.notna(r.atr) else np.nan,
+                  'failed_at': None, 'superseded_at': None}
+        episodes.append(active)
+    records = []
+    for ep in episodes:
+        t0 = ep['confirmed_at']
+        t_end = ep['failed_at'] or ep['superseded_at'] or asof
+        future = completed[(completed.signal_time > t0) & (completed.signal_time <= t_end)]
+        # Only candles strictly after confirmation are used to measure persistence.
+        age = max(0, int((min(t_end, asof) - t0).total_seconds() / 60))
+        direction_sign = 1 if ep['direction'] == 'UP' else -1
+        atr = ep['atr']
+        move = direction_sign * (float(d.close.iloc[-1]) - ep['confirmation_close'])
+        max_extension = np.nan
+        if not future.empty:
+            extremes = future.high if direction_sign == 1 else future.low
+            max_extension = max(0.0, float((direction_sign * (extremes - ep['boundary'])).max()))
+        # Status is about observed price behavior, not a future forecast.
+        if ep['failed_at'] is not None:
+            status = 'FAILED / RECLAIMED'
+        elif ep['superseded_at'] is not None:
+            status = 'SUPERSEDED'
+        elif np.isfinite(atr) and atr > 0 and move < -adverse_atr * atr:
+            status = 'WEAKENING'
+        elif age >= 15 and np.isfinite(atr) and atr > 0 and (not np.isfinite(max_extension) or max_extension < atr_extension * atr):
+            status = 'NO FOLLOW-THROUGH'
+        elif age >= 15:
+            status = 'HOLDING 15M+'
+        elif age >= 10:
+            status = 'HOLDING 10M'
+        elif age >= 5:
+            status = 'HOLDING 5M'
+        else:
+            status = 'FILTERS PASSED'
+        # The latest price applies only to active episodes. For closed episodes,
+        # use the close of the completed bar at the resolution timestamp.
+        if ep['failed_at'] is not None or ep['superseded_at'] is not None:
+            at = ep['failed_at'] or ep['superseded_at']
+            observed = completed[completed.signal_time <= at]
+            last_price = float(observed.close.iloc[-1]) if not observed.empty else np.nan
+        else:
+            last_price = float(d.close.iloc[-1])
+        directional_return = direction_sign * (last_price / ep['confirmation_close'] - 1) * 100 if np.isfinite(last_price) else np.nan
+        records.append({'Confirmed (ET)': t0, 'Direction': ep['direction'],
+                        'Status': status, 'Age (min)': age,
+                        'Confirm price': ep['confirmation_close'],
+                        'Frozen boundary': ep['boundary'],
+                        'Latest / exit price': last_price,
+                        'Directional change %': directional_return,
+                        'Max extension / ATR': max_extension / atr if np.isfinite(max_extension) and np.isfinite(atr) and atr > 0 else np.nan,
+                        'Resolved at (ET)': ep['failed_at'] or ep['superseded_at']})
+    return pd.DataFrame(records)
+
+
+def render_followthrough_tracker(raw, boxes, day):
+    st.subheader('Breakout Follow-Through Tracker')
+    events = breakout_followthrough(raw, boxes, day)
+    if events.empty:
+        st.info('No confirmed box breakouts yet. The tracker starts only after a five-minute signal passes all existing filters.')
+        return
+    latest = events.iloc[-1]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric('Last confirmed direction', latest['Direction'])
+    c2.metric('Current status', latest['Status'])
+    c3.metric('Minutes observed', int(latest['Age (min)']))
+    c4.metric('Directional change', f"{latest['Directional change %']:+.3f}%")
+    st.caption('FILTERS PASSED = original five-minute confirmation. HOLDING = still beyond the frozen boundary; '
+               'WEAKENING = adverse move of at least 0.15 ATR from confirmation; '
+               'NO FOLLOW-THROUGH = no 0.25 ATR extension after 15 minutes; '
+               'FAILED = a completed five-minute candle reclaimed the frozen boundary. '
+               'These are descriptive states, not new trading signals.')
+    with st.expander('All confirmed episodes and frozen levels', expanded=False):
+        st.dataframe(events, hide_index=True, use_container_width=True)
+        st.download_button('Download follow-through audit CSV', events.to_csv(index=False),
+                           file_name=f'followthrough_{day}.csv', mime='text/csv', key=f'followthrough_download_{day}')
+
+
 def historical_detection_threshold_study(raw, lookback=12, max_width=0.9,
                                          thresholds=(1.0, 1.1, 1.2, 1.3),
                                          train_fraction=0.7):
@@ -1618,6 +1739,7 @@ def live_dashboard():
                     f"${latest_event['price']:.2f} | {latest_event['direction']}. "
                     "Historical detection event, not an entry recommendation.")
         st.plotly_chart(fig, use_container_width=True)
+        render_followthrough_tracker(raw, boxes, latest_day)
         st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
         render_trend_duration_tracker(boxes, raw, latest_day)
         render_reversal_panel(raw, boxes, latest_day, reclaim_window)
@@ -1709,6 +1831,7 @@ if 'test_comparison' in st.session_state:
     fig, levels, _ = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
                                 chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes, detection_bundle=replay_bundle)
     st.plotly_chart(fig, use_container_width=True)
+    render_followthrough_tracker(st.session_state['test_raw'], st.session_state['test_boxes'], chosen)
     render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
     render_reversal_panel(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window)
     render_detection_lab(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window, sustain_window, min_tod_sessions, detection_bundle=replay_bundle)
