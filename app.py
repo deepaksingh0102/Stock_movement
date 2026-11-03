@@ -1378,6 +1378,7 @@ def chart_for_day(raw, boxes, day, opening_minutes, visible_bars, chart_display=
                     name='Resistance trendline' if is_high else 'Support trendline',
                     line=dict(color=color, width=2, dash='dash')))
     # V16.6 visual-only signal overlay: event detection and trade rules unchanged.
+    latest_event = None  # Defined even when no eligible signal exists.
     display_events = []
     if signal_visibility != 'Hide markers':
         if not stage_events.empty:
