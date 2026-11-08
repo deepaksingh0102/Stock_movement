@@ -12,7 +12,7 @@ import pandas_market_calendars as mcal
 
 NY = ZoneInfo('America/New_York')
 UTC = dt.timezone.utc
-st.set_page_config(page_title='Stock Movement | Box Theory V16.7 Follow-Through', layout='wide')
+st.set_page_config(page_title='Stock Movement | Box Theory V16.8 RVOL + Order Flow', layout='wide')
 
 
 def secret(*names, default=''):
@@ -50,7 +50,12 @@ def clean(raw, naive_tz='America/New_York'):
     required = ['open', 'high', 'low', 'close', 'volume']
     if any(c not in df for c in required):
         raise ValueError('CSV needs timestamp, open, high, low, close, volume columns')
-    df = df[required].apply(pd.to_numeric, errors='coerce').dropna()
+    # Optional classified trade-volume columns supplied by a compatible CSV.
+    optional = [c for c in ('buy_volume', 'sell_volume') if c in df.columns]
+    df = df[required + optional].apply(pd.to_numeric, errors='coerce')
+    df = df.dropna(subset=required)
+    for c in optional:
+        df.loc[df[c] < 0, c] = np.nan
     df = df[~df.index.isna()]
     df = df[~df.index.duplicated(keep='last')].sort_index()
     df = df.between_time('09:30', '15:59')
@@ -174,9 +179,12 @@ def to_five_minute(raw):
     """Five one-minute bars per candle, no partial candles, no overnight mixing."""
     out = []
     for _, d in raw.groupby(raw.index.date):
-        agg = d.resample('5min', label='left', closed='left').agg({
-            'open': 'first', 'high': 'max', 'low': 'min',
-            'close': 'last', 'volume': 'sum'})
+        aggregation = {'open': 'first', 'high': 'max', 'low': 'min',
+                       'close': 'last', 'volume': 'sum'}
+        for optional in ('buy_volume', 'sell_volume'):
+            if optional in d:
+                aggregation[optional] = lambda x: x.sum(min_count=len(x))
+        agg = d.resample('5min', label='left', closed='left').agg(aggregation)
         counts = d['close'].resample('5min', label='left', closed='left').count()
         agg = agg[counts.reindex(agg.index, fill_value=0) == 5].dropna()
         if not agg.empty:
@@ -743,6 +751,129 @@ def time_of_day_rvol(raw, boxes, min_sessions=5, history_sessions=20):
         if len(idx):
             results.loc[idx] = pd.Series(vals, index=today.index).reindex(idx)
     return results
+
+
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=8)
+def volume_orderflow_indicators(raw, history_sessions=20, min_sessions=5):
+    """Completed 5m same-slot and cumulative time-of-day RVOL, past days only.
+
+    Optional buy/sell volume must come from classified trades in uploaded CSV.
+    OHLCV alone cannot reveal trade aggressor direction. No proxy is invented.
+    """
+    five = to_five_minute(raw)
+    if five.empty:
+        return pd.DataFrame()
+    result = five.copy()
+    for field in ('rvol_5m', 'rvol_cumulative', 'buy_pct', 'delta', 'delta_pct', 'cvd'):
+        result[field] = np.nan
+    days = sorted(set(five.index.date))
+    for k, day in enumerate(days):
+        current = five[five.index.date == day].copy()
+        idx = current.index
+        if 'buy_volume' in current and 'sell_volume' in current:
+            buy = current['buy_volume']
+            sell = current['sell_volume']
+            classified = buy + sell
+            valid = (classified > 0) & (classified <= current.volume * 1.01)
+            result.loc[idx, 'buy_pct'] = (100 * buy / classified).where(valid)
+            result.loc[idx, 'delta'] = (buy - sell).where(valid)
+            result.loc[idx, 'delta_pct'] = (100 * (buy - sell) / classified).where(valid)
+            # Do not carry CVD across gaps in classified data.
+            delta = (buy - sell).where(valid)
+            result.loc[idx, 'cvd'] = delta.fillna(0).cumsum().where(valid)
+        prior_days = days[max(0, k-history_sessions):k]
+        if len(prior_days) < min_sessions:
+            continue
+        prior = five[np.isin(five.index.date, prior_days)].copy()
+        prior['slot'] = prior.index.strftime('%H:%M')
+        current_slots = idx.strftime('%H:%M')
+        counts = prior.groupby('slot').volume.count()
+        means = prior.groupby('slot').volume.mean().replace(0, np.nan)
+        baseline = means.reindex(current_slots).to_numpy()
+        count = counts.reindex(current_slots).fillna(0).to_numpy()
+        result.loc[idx, 'rvol_5m'] = np.where(count >= min_sessions,
+            current.volume.to_numpy() / baseline, np.nan)
+        # Cumulative reference only includes historical sessions with all
+        # preceding five-minute slots present, avoiding sparse-day distortion.
+        prior_pivot = prior.pivot_table(index=prior.index.date, columns='slot',
+                                        values='volume', aggfunc='sum')
+        canonical_slots = list(pd.date_range('2000-01-03 09:30', periods=78,
+                                             freq='5min').strftime('%H:%M'))
+        for pos, (ts, vol) in enumerate(zip(idx, current.volume)):
+            slot = ts.strftime('%H:%M')
+            if slot not in canonical_slots:
+                continue
+            required = canonical_slots[:canonical_slots.index(slot)+1]
+            eligible = prior_pivot.reindex(columns=required).dropna()
+            if len(eligible) < min_sessions:
+                continue
+            reference = eligible.sum(axis=1).mean()
+            if reference > 0:
+                result.at[ts, 'rvol_cumulative'] = current.volume.iloc[:pos+1].sum() / reference
+    return result
+
+
+def render_orderflow_panel(raw, boxes, day, rvol_threshold=1.5, min_sessions=5):
+    st.subheader('Order Flow + Relative Volume | V16.8')
+    data = volume_orderflow_indicators(raw, 20, min_sessions)
+    current = data[data.index.date == day] if not data.empty else data
+    if current.empty:
+        st.info('Waiting for completed five-minute candles.')
+        return
+    latest = current.iloc[-1]
+    def fmt(value, suffix='x'):
+        return f'{value:.2f}{suffix}' if pd.notna(value) else 'N/A'
+    a,b,c,d = st.columns(4)
+    a.metric('5m time-of-day RVOL', fmt(latest.rvol_5m))
+    b.metric('Cumulative session RVOL', fmt(latest.rvol_cumulative))
+    c.metric('Aggressive buy share', fmt(latest.buy_pct, '%'))
+    d.metric('Estimated delta %', fmt(latest.delta_pct, '%'))
+    if pd.isna(latest.rvol_5m):
+        st.info(f'RVOL unavailable: requires at least {min_sessions} earlier sessions with matching completed 5-minute intervals.')
+    elif latest.rvol_5m < 1.0:
+        st.warning('Below-normal volume: treat any breakout without other confirmation cautiously.')
+    elif latest.rvol_5m < rvol_threshold:
+        st.info('Volume near normal; breakout participation has not met the selected RVOL threshold.')
+    else:
+        st.success('Elevated participation versus the same time on earlier sessions. Direction still requires price/trend confirmation.')
+    if pd.isna(latest.delta_pct):
+        st.caption('Buy/sell pressure unavailable from Alpaca OHLCV bars. Upload 1-minute CSV with buy_volume and sell_volume columns classified from trades to enable delta and CVD. These estimates depend on the classification method.')
+    else:
+        st.caption('Buy/sell volume is sourced from uploaded classified trade-volume columns, not inferred from candle direction.')
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=current.index + pd.Timedelta(minutes=5),
+                         y=current.rvol_5m, name='5m same-time RVOL',
+                         marker_color='#2563eb'))
+    fig.add_trace(go.Scatter(x=current.index + pd.Timedelta(minutes=5),
+                             y=current.rvol_cumulative, name='Cumulative RVOL',
+                             line=dict(color='#f59e0b', width=2)))
+    fig.add_hline(y=rvol_threshold, line_dash='dash', line_color='#dc2626',
+                  annotation_text=f'RVOL threshold {rvol_threshold:.1f}x')
+    fig.update_layout(height=270, xaxis_title='Completed candle end (ET)',
+                      yaxis_title='Relative volume (x)', margin=dict(t=15,b=30))
+    st.plotly_chart(fig, use_container_width=True)
+    # Compare crossing bars, without changing original trade/backtest signals.
+    day_boxes = boxes[boxes.index.date == day]
+    crossings = day_boxes[day_boxes.price_break_up | day_boxes.price_break_down].copy()
+    if not crossings.empty:
+        crossings = crossings.join(data[['rvol_5m','rvol_cumulative','delta_pct']], how='left')
+        crossings['Direction'] = np.where(crossings.price_break_up, 'UP', 'DOWN')
+        crossings['Volume assessment'] = np.where(
+            crossings.rvol_5m.isna(), 'INSUFFICIENT HISTORY',
+            np.where(crossings.rvol_5m >= rvol_threshold, 'VOLUME CONFIRMED',
+                     'UNCONFIRMED - LOW VOLUME'))
+        report = crossings[['signal_time','Direction','close','rvol_5m',
+                            'rvol_cumulative','delta_pct','Volume assessment','signal']].copy()
+        st.markdown('**Box breakout volume audit (completed 5m candles)**')
+        st.dataframe(report.tail(30), hide_index=True, use_container_width=True)
+        st.download_button('Download order flow / RVOL breakout audit',
+                           report.to_csv(index=False), file_name=f'orderflow_rvol_{day}.csv',
+                           mime='text/csv', key=f'orderflow_download_{day}')
+    else:
+        st.caption('No eligible box price crossings to evaluate for this session.')
+    st.caption('RVOL is a participation filter, not a direction or win-probability signal. Existing V16.7 trading/backtest rules are unchanged.')
 
 
 def detection_engine(raw, boxes, reclaim_bars=3, sustain_bars=2,
@@ -1617,8 +1748,8 @@ def historical_detection_threshold_study(raw, lookback=12, max_width=0.9,
             output.append(result)
     return pd.DataFrame(output), cutoff
 
-st.title('Stock Movement V16.5 | Box Theory & Detection Lab')
-st.caption('Research only. V15 frozen-boundary detection, MACD slope/acceleration and time-of-day RVOL are diagnostic only; original trading/backtest signals remain unchanged. No orders are placed.')
+st.title('Stock Movement V16.8 | Box Theory, Order Flow & RVOL')
+st.caption('Research only. New same-time 5m/cumulative RVOL and optional classified order flow are diagnostic; original V16.7 trading/backtest signals remain unchanged. No orders are placed.')
 
 # Pausing disables the fragment timer itself, not just Alpaca requests.
 # A normal Streamlit widget rerun rebuilds the fragment with run_every=None.
@@ -1658,6 +1789,7 @@ with st.sidebar:
     reclaim_window = st.slider('Failed-breakout reclaim window (5m bars)', 1, 6, 3)
     sustain_window = st.slider('Sustained breakout confirmation (5m bars)', 1, 3, 2)
     min_tod_sessions = st.slider('Minimum prior sessions for time-of-day RVOL', 2, 15, 5)
+    orderflow_rvol_threshold = st.slider('Order-flow breakout RVOL warning threshold', 1.0, 3.0, 1.5, 0.1)
     hold_minutes = st.selectbox('Maximum holding time', [5, 15, 30, 60], index=2)
     stop_atr = st.slider('Stop distance (ATR multiplier)', 0.5, 3.0, 1.2, 0.1)
     reward_risk = st.slider('Profit target (reward/risk)', 0.5, 4.0, 1.5, 0.1)
@@ -1739,6 +1871,7 @@ def live_dashboard():
                     f"${latest_event['price']:.2f} | {latest_event['direction']}. "
                     "Historical detection event, not an entry recommendation.")
         st.plotly_chart(fig, use_container_width=True)
+        render_orderflow_panel(raw, boxes, latest_day, orderflow_rvol_threshold, min_tod_sessions)
         render_followthrough_tracker(raw, boxes, latest_day)
         st.caption('Trading BOX_HIGH is red; trading BOX_LOW is blue. Optional gray developing/live boxes are visual only. Confirmed 5m boxes remain the trade/backtest reference.')
         render_trend_duration_tracker(boxes, raw, latest_day)
@@ -1831,6 +1964,7 @@ if 'test_comparison' in st.session_state:
     fig, levels, _ = chart_for_day(st.session_state['test_raw'], st.session_state['test_boxes'],
                                 chosen, opening, windows[window], chart_display, st.session_state['test_settings'][0], show_developing_boxes, detection_bundle=replay_bundle)
     st.plotly_chart(fig, use_container_width=True)
+    render_orderflow_panel(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, orderflow_rvol_threshold, min_tod_sessions)
     render_followthrough_tracker(st.session_state['test_raw'], st.session_state['test_boxes'], chosen)
     render_trend_duration_tracker(st.session_state['test_boxes'], st.session_state['test_raw'], chosen)
     render_reversal_panel(st.session_state['test_raw'], st.session_state['test_boxes'], chosen, reclaim_window)
